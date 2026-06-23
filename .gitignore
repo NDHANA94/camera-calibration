@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+server/data/profiles/*
+server/data/sessions/*
+!server/data/profiles/.gitkeep
+!server/data/sessions/.gitkeep
+*.npz
+*.yaml
+*.png
+.DS_Store

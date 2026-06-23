@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <title>Sintez Camera Calibration</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+    <div class="app">
+        <aside>
+            <h1>Sintez Camera Calibration</h1>
+
+            <!-- Source tabs -->
+            <div class="tabs">
+                <button class="tab active" data-tab="local">Local</button>
+                <button class="tab" data-tab="remote">Remote</button>
+            </div>
+
+            <!-- Local camera -->
+            <section id="local-panel">
+                <h2>Camera</h2>
+                <div class="row">
+                    <select id="local-camera"></select>
+                    <button id="refresh-cameras" class="secondary small" title="Refresh camera list">↻</button>
+                </div>
+            </section>
+
+            <!-- Remote agent -->
+            <section id="remote-panel" hidden>
+                <h2>Remote Connection</h2>
+
+                <!-- Saved profiles list (rendered by JS) -->
+                <div id="ssh-profiles-list"></div>
+                <button id="ssh-add-connection" class="secondary small" style="margin-top:4px;width:100%">+ New Connection</button>
+
+                <!-- Profile form (hidden until Add/Edit) -->
+                <div id="ssh-form-panel" hidden style="margin-top:8px;padding:8px;border:1px solid var(--border);border-radius:4px">
+                    <input id="ssh-profile-name" placeholder="Name (e.g. Orin NX)" style="margin-bottom:4px" />
+                    <label>Host / IP</label>
+                    <input id="ssh-host" placeholder="192.168.1.100" />
+                    <div class="row" style="margin-top:4px">
+                        <div style="flex:1">
+                            <label>Port</label>
+                            <input id="ssh-port" type="number" value="22" min="1" max="65535" />
+                        </div>
+                        <div style="flex:2;margin-left:6px">
+                            <label>Username</label>
+                            <input id="ssh-user" placeholder="ubuntu" />
+                        </div>
+                    </div>
+                    <label>Password</label>
+                    <input id="ssh-pass" type="password" placeholder="••••••••" />
+                    <label style="margin-top:4px">Agent Port</label>
+                    <input id="agent-port" type="number" value="8765" min="1" max="65535" />
+                    <small style="color:var(--muted, #888)">Port the agent binds on the remote (loopback). Change if 8765 is taken (e.g. 8766).</small>
+                    <div class="row" style="margin-top:6px;gap:6px">
+                        <button id="ssh-save-profile" class="secondary" style="flex:1">Save</button>
+                        <button id="ssh-cancel-form" class="secondary" style="flex:1">Cancel</button>
+                    </div>
+                </div>
+
+                <!-- Single connect / disconnect toggle -->
+                <button id="ssh-toggle-conn" class="full" style="margin-top:8px" disabled>&#x21C4; Connect</button>
+
+                <!-- Post-connect panel -->
+                <div id="ssh-connected-panel" hidden>
+                    <div style="margin-top:8px">
+                        <span id="ssh-conn-label" class="pill ok">Connected</span>
+                    </div>
+
+                    <!-- Agent not installed -->
+                    <div id="agent-not-installed-panel" hidden style="margin-top:8px">
+                        <span class="pill bad">Agent: not installed</span>
+                        <button id="install-agent-btn" class="full" style="margin-top:6px">&#x2B07; Install Agent</button>
+                        <pre id="install-log" class="cmd-block" hidden></pre>
+                    </div>
+
+                    <!-- Agent installed but not running -->
+                    <div id="agent-installed-panel" hidden style="margin-top:8px">
+                        <span id="agent-installed-pill" class="pill ok">Agent: installed</span>
+                        <span id="agent-version-pill" class="pill" hidden></span>
+
+                        <!-- Shown only when the remote version differs from the bundled one -->
+                        <div id="agent-update-banner" hidden style="margin-top:6px;font-size:12px;color:var(--warn,#d28a00)">
+                            ⚠ A newer agent (<span id="agent-latest-version">?</span>) is bundled with this server.
+                        </div>
+
+                        <label style="margin-top:8px">Server URL (as seen from remote)</label>
+                        <input id="ssh-server-url" placeholder="auto-detect" />
+                        <button id="enable-agent-btn" class="full" style="margin-top:6px">&#x25B6; Enable Agent</button>
+
+                        <div class="row" style="margin-top:6px;gap:6px">
+                            <button id="reinstall-agent-btn" class="secondary small" style="flex:1">&#x21BB; Reinstall / Update</button>
+                            <button id="remove-agent-btn" class="danger small" style="flex:1">&#x1F5D1; Remove</button>
+                        </div>
+                        <pre id="manage-log" class="cmd-block" hidden></pre>
+                    </div>
+
+                    <!-- Agent enabling (waiting for WS + camera list) -->
+                    <div id="agent-enabling-panel" hidden style="margin-top:8px">
+                        <span class="pill warn">Enabling agent …</span>
+                        <pre id="agent-log" class="cmd-block" hidden></pre>
+                    </div>
+
+                    <!-- Agent running — camera selection -->
+                    <div id="agent-running-panel" hidden style="margin-top:8px">
+                        <span class="pill ok">Agent: running</span>
+                        <div class="row" style="margin-top:8px;align-items:flex-end;gap:6px">
+                            <div style="flex:1">
+                                <label>Remote Camera</label>
+                                <select id="remote-camera-select"></select>
+                            </div>
+                            <button id="refresh-remote-cameras" class="secondary small" title="Re-scan remote cameras">&#x21BB;</button>
+                        </div>
+                        <button id="disable-agent-btn" class="danger full" style="margin-top:6px">&#x25A0; Disable Agent</button>
+                        <button id="re-enable-agent-btn" class="secondary small" style="margin-top:4px;width:100%">&#x21BA; Restart Agent</button>
+                    </div>
+                </div>
+
+                <!-- Manual token fallback -->
+                <details style="margin-top:12px">
+                    <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Manual: run agent yourself</summary>
+                    <button id="issue-token" class="secondary" style="margin-top:6px;width:100%">Issue Token</button>
+                    <input id="remote-token" readonly placeholder="token appears here" style="margin-top:4px" />
+                    <pre id="agent-cmd" class="cmd-block"></pre>
+                </details>
+            </section>
+
+            <!-- Chessboard parameters -->
+            <h2>Chessboard</h2>
+            <label>Inner corners (W × H)</label>
+            <div class="row">
+                <input type="number" id="board-w" value="9" min="2" max="30" />
+                <span class="sep">×</span>
+                <input type="number" id="board-h" value="6" min="2" max="30" />
+            </div>
+            <label>Square size (mm)</label>
+            <input type="number" id="square-size" value="25" min="0.1" step="0.1" />
+            <label>Captures required</label>
+            <input type="number" id="required-captures" value="20" min="3" max="200" />
+
+            <details class="advanced">
+                <summary>Advanced options</summary>
+                <div class="flag-group">
+                    <label class="flag-row"><input type="checkbox" class="calib-flag" value="4096" /> Zero tangential distortion</label>
+                    <label class="flag-row"><input type="checkbox" class="calib-flag" value="1024" /> Fix aspect ratio</label>
+                    <label class="flag-row"><input type="checkbox" class="calib-flag" value="16384" /> Rational model</label>
+                </div>
+            </details>
+
+            <!-- Profile -->
+            <h2>Profile</h2>
+            <label>Name</label>
+            <input id="session-name" placeholder="e.g. front_left" />
+            <div class="row" style="margin-top:6px">
+                <select id="profile-select" class="flex2"></select>
+                <button id="save-profile" class="secondary small">Save</button>
+                <button id="delete-profile" class="danger small">Del</button>
+            </div>
+
+            <!-- Capture controls -->
+            <h2>Capture</h2>
+            <button id="start-session" class="full">▶ Start Capture</button>
+            <div class="row" style="margin-top:6px">
+                <button id="capture-now" class="secondary" disabled>Capture Now</button>
+                <button id="abort-session" class="danger" disabled>Abort</button>
+            </div>
+            <button id="finish-session" class="success full" disabled style="margin-top:6px">Finish &amp; Calibrate</button>
+        </aside>
+
+        <main>
+            <div class="video-wrap">
+                <canvas id="preview"></canvas>
+            </div>
+            <div class="statusbar">
+                <span class="pill" id="state-pill">idle</span>
+                <span class="pill" id="captures-pill">captures: 0 / —</span>
+                <span class="pill" id="board-pill">board: —</span>
+                <span class="pill" id="blur-pill">blur: —</span>
+                <span class="pill" id="conn-pill">disconnected</span>
+            </div>
+            <div class="hint" id="hint">Pick a camera and press Start Capture to begin.</div>
+            <div class="result" id="result" hidden></div>
+
+            <div class="detail-panel" id="detail-panel" hidden>
+                <div class="detail-header">
+                    <span id="detail-title">Session Detail</span>
+                    <div style="display:flex;gap:5px;align-items:center">
+                        <button id="copy-intrinsics" class="secondary small" hidden>Copy YAML</button>
+                        <button class="secondary small" onclick="closeDetail()">✕</button>
+                    </div>
+                </div>
+                <div id="detail-body"></div>
+            </div>
+
+            <details class="sessions-panel" id="sessions-panel" open>
+                <summary>
+                    <span>Sessions</span>
+                    <button id="refresh-sessions" class="secondary small" title="Refresh list" onclick="event.preventDefault(); loadSessionList()">↻</button>
+                </summary>
+                <div id="sessions-list"><span class="session-empty">Loading…</span></div>
+            </details>
+        </main>
+    </div>
+
+    <!-- Frame lightbox -->
+    <div class="lightbox" id="lightbox" hidden>
+        <button class="lb-close" onclick="closeLightbox()">✕</button>
+        <button class="lb-nav lb-prev" onclick="lightboxNav(-1)">&#8249;</button>
+        <div class="lb-content">
+            <img id="lb-img" class="lb-img" />
+            <div class="lb-counter" id="lb-counter"></div>
+        </div>
+        <button class="lb-nav lb-next" onclick="lightboxNav(1)">&#8250;</button>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

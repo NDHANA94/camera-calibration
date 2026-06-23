@@ -1,0 +1,10 @@
+[
+  {
+    "name": "orin-nx",
+    "host": "192.168.55.2",
+    "port": 22,
+    "username": "orin-nx",
+    "password": "orin",
+    "agent_port": 8766
+  }
+]
