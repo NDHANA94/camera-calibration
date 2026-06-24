@@ -14,10 +14,27 @@
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; }
 
-.app { display: grid; grid-template-columns: 300px 1fr; height: 100vh; }
+.app { display: grid; grid-template-columns: 300px minmax(0, 1fr) 680px; height: 100vh; }
 
-aside { background: var(--panel); padding: 14px; overflow-y: auto; border-right: 1px solid #111; }
-main { padding: 16px; overflow: auto; }
+aside.controls { background: var(--bg); padding: 12px; overflow-y: auto; border-right: 1px solid #111; }
+main { padding: 16px; overflow: auto; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+
+/* Cards group related controls in the left panel */
+.card {
+    background: var(--panel); border: 1px solid #33383f; border-radius: 8px;
+    padding: 11px 12px; margin-bottom: 10px;
+}
+.card > h2:first-child { margin-top: 0; }
+.card-title {
+    font-size: 11px; font-weight: 700; margin: 0 0 8px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.06em;
+}
+aside.rightbar { background: var(--panel); padding: 14px; overflow-y: auto; border-left: 1px solid #111; }
+
+@media (max-width: 1400px) {
+    .app { grid-template-columns: 280px 1fr; }
+    aside.rightbar { grid-column: 1 / -1; border-left: 0; border-top: 1px solid #111; }
+}
 
 h1 { font-size: 17px; margin: 0 0 10px; }
 h2 { font-size: 11px; margin: 14px 0 5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
@@ -46,7 +63,11 @@ button.danger { background: var(--danger); }
 button.success { background: var(--ok); color: #111; }
 button.full { width: 100%; margin-top: 6px; padding: 9px; font-size: 14px; }
 button.small { padding: 5px 9px; font-size: 12px; flex-shrink: 0; }
-button:disabled { opacity: 0.4; cursor: not-allowed; }
+button:not(:disabled):hover { filter: brightness(1.12); }
+button:not(:disabled):active { filter: brightness(0.92); }
+button:disabled {
+    opacity: 0.35; cursor: not-allowed; filter: grayscale(0.6); box-shadow: none;
+}
 
 /* Row layout */
 .row { display: flex; gap: 5px; align-items: center; }
@@ -80,35 +101,78 @@ details.advanced[open] summary::before { content: "▾ "; }
 }
 .flag-row input[type=checkbox] { width: auto; flex-shrink: 0; accent-color: var(--accent); }
 
-/* Video area */
+/* Video area — the frame always fits the panel width; height follows the
+   frame's aspect ratio (no scrolling). */
 .video-wrap {
     position: relative; background: #000; border-radius: 8px; overflow: hidden;
-    aspect-ratio: 4 / 3; display: flex; align-items: center; justify-content: center;
+    flex: 0 0 auto; width: 100%; display: flex; align-items: center; justify-content: center;
 }
-.video-wrap canvas { width: 100%; height: 100%; object-fit: contain; display: block; }
+.video-wrap canvas { width: 100%; height: auto; display: block; }
 
-/* Status bar */
-.statusbar {
-    margin-top: 8px; padding: 7px 12px; background: var(--panel); border-radius: 6px;
-    display: flex; gap: 12px; font-size: 12px; flex-wrap: wrap;
+/* Captured-frames strip (under the live view, shows annotated captures) */
+.captured-strip { background: var(--panel); border-radius: 6px; padding: 8px 10px; }
+.captured-strip-title {
+    font-size: 10px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 6px;
+    display: flex; justify-content: space-between; align-items: center;
 }
-.statusbar .pill { background: var(--panel-2); padding: 3px 8px; border-radius: 999px; }
-.statusbar .pill.ok { color: var(--ok); }
-.statusbar .pill.warn { color: var(--warn); }
-.statusbar .pill.bad { color: var(--danger); }
+.captured-thumbs {
+    display: flex; gap: 5px; overflow-x: auto; padding-bottom: 2px;
+}
+.captured-thumbs img {
+    height: 60px; width: auto; border-radius: 3px; background: #000;
+    cursor: pointer; border: 2px solid transparent; flex-shrink: 0;
+}
+.captured-thumbs img:hover { border-color: var(--accent); }
+.captured-thumbs .empty { font-size: 12px; color: var(--muted); padding: 18px 4px; }
+
+/* Pills (status indicators) */
+.pill { display: inline-block; background: var(--panel-2); padding: 3px 9px; border-radius: 999px; font-size: 12px; }
+.pill.ok   { color: var(--ok); }
+.pill.warn { color: var(--warn); }
+.pill.bad  { color: var(--danger); }
+
+/* Calibration status card (top of right panel) */
+.status-card {
+    background: var(--panel-2); border-radius: 8px; padding: 12px;
+    border: 1px solid #3a3f48; margin-bottom: 12px;
+}
+.status-card.running { border-color: var(--accent); }
+.status-card.finished { border-color: var(--ok); }
+.status-card.failed { border-color: var(--danger); }
+.status-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.status-title { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+.status-progress { margin-top: 10px; }
+.status-progress-label { font-size: 12px; margin-bottom: 5px; color: var(--text); }
+.progress { height: 8px; background: #1a1d22; border-radius: 999px; overflow: hidden; }
+.progress-bar { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width 0.25s ease; }
+.progress-bar.full { background: var(--ok); }
+.status-metrics { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
 
 .hint {
-    margin-top: 8px; padding: 9px 12px; background: var(--panel); border-left: 3px solid var(--accent);
-    font-size: 13px; min-height: 36px; line-height: 1.4;
+    padding: 9px 12px; background: var(--panel-2); border-left: 3px solid var(--accent);
+    border-radius: 4px; font-size: 13px; min-height: 36px; line-height: 1.4;
 }
 
-.result {
-    margin-top: 12px; padding: 12px; background: var(--panel); border-radius: 6px;
-    font-size: 13px; border-left: 3px solid var(--ok);
-}
-.result code { background: var(--panel-2); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+/* Middle-panel views: live / detail-result / placeholder are mutually exclusive */
+#live-view { display: flex; flex-direction: column; gap: 10px; }
+#live-view[hidden], #detail-panel[hidden], #middle-placeholder[hidden] { display: none; }
 
-/* Session detail panel */
+.middle-placeholder {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    min-height: 360px; padding: 30px; text-align: center;
+    color: var(--muted); font-size: 14px; line-height: 1.6;
+    border: 1px dashed #33383f; border-radius: 8px;
+}
+
+.result-banner {
+    margin: 10px 14px 0; padding: 10px 12px; border-radius: 6px; font-size: 13px;
+    background: #14361f; border-left: 3px solid var(--ok);
+}
+.result-banner.failed { background: #3a1418; border-left-color: var(--danger); }
+.result-banner code { background: var(--panel-2); padding: 1px 6px; border-radius: 3px; }
+
+/* Session detail panel (now lives in the middle panel) */
 .detail-panel {
     margin-top: 12px; background: var(--panel); border-radius: 6px; overflow: hidden;
     border-left: 3px solid var(--accent);
@@ -218,6 +282,16 @@ details.sessions-panel[open] > summary::before { content: "▾ "; }
 .session-badge.failed   { background: #3d1a1e; color: var(--danger); }
 .session-actions { display: flex; gap: 4px; flex-shrink: 0; }
 
+/* Date + time + params for the history row. */
+.session-row-bottom {
+    display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline;
+    padding-left: 1px;
+}
+.session-when {
+    font-size: 11px; color: var(--muted); white-space: nowrap;
+    background: var(--panel-2); padding: 1px 7px; border-radius: 999px;
+}
+
 .health-badge {
     font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 999px;
     white-space: nowrap; flex-shrink: 0; cursor: default; letter-spacing: 0.02em;
@@ -226,3 +300,121 @@ details.sessions-panel[open] > summary::before { content: "▾ "; }
 .health-badge.warn { background: #3d3010; color: var(--warn); }
 .health-badge.bad  { background: #3d1a1e; color: var(--danger); }
 .health-badge.muted { background: var(--panel-2); color: var(--muted); }
+
+/* ---------- Chessboard summary card (left panel) ---------- */
+.chess-current {
+    font-size: 13px; background: var(--panel-2); border-radius: 4px;
+    padding: 8px 10px; min-height: 18px; line-height: 1.45;
+}
+.chess-current .empty { color: var(--muted); font-style: italic; font-size: 12px; }
+.chess-summary-detail { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; }
+
+/* LEFT / RIGHT labels next to camera selects (used in dual mode) */
+.cam-side-label {
+    flex: 0 0 38px; font-size: 10px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.06em; padding-top: 18px;
+}
+
+/* ---------- Chessboard overlay dialog ---------- */
+.overlay-backdrop {
+    position: fixed; inset: 0; z-index: 1000;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+}
+.overlay-backdrop[hidden] { display: none; }
+
+.overlay-dialog {
+    background: var(--panel); border: 1px solid #33383f; border-radius: 10px;
+    width: min(880px, 100%); max-height: 90vh; overflow: hidden;
+    display: flex; flex-direction: column;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+}
+.overlay-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px; border-bottom: 1px solid #111;
+    font-size: 14px; font-weight: 700;
+}
+.overlay-close {
+    background: transparent; color: var(--text); border: 0; cursor: pointer;
+    font-size: 18px; padding: 0 6px; line-height: 1;
+}
+.overlay-close:hover { filter: brightness(1.4); }
+.overlay-body {
+    display: grid; grid-template-columns: minmax(220px, 280px) 1fr; gap: 0;
+    min-height: 320px; overflow: hidden;
+}
+.overlay-list {
+    border-right: 1px solid #111; padding: 12px;
+    overflow-y: auto; background: var(--panel-2);
+}
+.cb-list-empty {
+    color: var(--muted); font-size: 12px; padding: 6px 4px;
+}
+.cb-row {
+    padding: 8px 10px; border-radius: 5px; cursor: pointer;
+    border: 1px solid transparent; margin-bottom: 4px;
+}
+.cb-row:hover { background: var(--panel); }
+.cb-row.active {
+    background: var(--panel); border-color: var(--accent);
+}
+.cb-row-name { font-size: 13px; font-weight: 600; }
+.cb-row-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+.overlay-form {
+    padding: 14px 18px; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 2px;
+}
+.overlay-form-help {
+    color: var(--muted); font-size: 12px; margin: 0 0 10px;
+    padding: 8px 10px; background: var(--panel-2);
+    border-radius: 4px; line-height: 1.4;
+}
+.overlay-form-actions { margin-top: 12px; }
+
+@media (max-width: 760px) {
+    .overlay-body { grid-template-columns: 1fr; }
+    .overlay-list { border-right: 0; border-bottom: 1px solid #111; max-height: 200px; }
+}
+
+/* ---------- SSH profile rows in the Remote Connection card ---------- */
+.ssh-profile-row {
+    align-items: center; gap: 4px;
+    margin-bottom: 4px;
+    border: 1px solid var(--border); border-radius: 3px;
+    padding: 4px 6px;
+    transition: background 0.15s, border-color 0.15s;
+}
+.ssh-profile-row.ssh-profile-active {
+    /* Active connected connection: accent border + subtle accent background */
+    border-color: var(--accent);
+    background: rgba(78, 161, 255, 0.08);
+}
+.ssh-profile-label {
+    flex: 1; font-size: 13px; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+}
+.ssh-profile-meta {
+    color: var(--muted); font-size: 11px; margin-left: 4px;
+}
+.ssh-profile-btn {
+    flex: 0 0 auto; padding: 3px 7px; font-size: 13px; line-height: 1;
+    border-radius: 3px; cursor: pointer; margin-top: 0;
+    background: var(--panel-2); color: var(--text); border: 0;
+    min-width: 26px; text-align: center;
+}
+.ssh-profile-btn:hover { filter: brightness(1.18); }
+.ssh-profile-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.ssh-profile-icon.ssh-profile-edit { background: var(--panel-2); }
+.ssh-profile-icon.ssh-profile-del {
+    background: var(--panel-2); color: var(--danger);
+}
+.ssh-profile-icon.ssh-profile-del:hover { background: rgba(255, 90, 95, 0.18); }
+.ssh-profile-active .ssh-profile-btn[data-profile-toggle] {
+    /* The toggle on the active row uses the accent color to read as "on" */
+    background: var(--accent); color: white;
+}
+.ssh-profile-active .ssh-profile-btn[data-profile-toggle]:hover {
+    filter: brightness(1.12);
+}

@@ -33,12 +33,13 @@ import time
 from typing import Optional
 
 import cv2
+import numpy as np
 
 from .camera import CameraCapture, list_local_cameras
 
 log = logging.getLogger(__name__)
 
-AGENT_VERSION = "0.2.2"
+AGENT_VERSION = "0.3.0"
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +286,82 @@ async def _stream_loop(ws_writer: asyncio.StreamReader,  # unused, kept for symm
         cap.close()
 
 
+async def _dual_stream_loop(
+    writer: asyncio.StreamWriter,
+    camera_id_left: str,
+    camera_id_right: str,
+    fps: int,
+    quality: int,
+) -> None:
+    """Open TWO cameras, send paired left|right frames as a single JPEG.
+
+    Used by the server for STEREO_SEPARATE sessions.  The server's dual
+    pipeline takes (left, right) arrays and treats them as paired eye frames
+    -- the agent just needs to deliver them in lockstep.  If the right
+    camera lags a frame, we resend the previous right side rather than
+    block (this keeps the pipeline running and is fine for calibration --
+    both eyes just see one repeated frame briefly).
+    """
+    capL = CameraCapture(camera_id_left, target_fps=fps)
+    capR = CameraCapture(camera_id_right, target_fps=fps)
+    try:
+        capL.open()
+        capR.open()
+    except Exception as exc:
+        try: capL.close()
+        except Exception: pass
+        try: capR.close()
+        except Exception: pass
+        _ws_send_text(writer, json.dumps({"type": "error", "message": str(exc)}))
+        await writer.drain()
+        return
+
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+    delay = 1.0 / max(fps, 1)
+    _ws_send_text(writer, json.dumps({
+        "type": "started",
+        "camera_left": camera_id_left,
+        "camera_right": camera_id_right,
+        "fps": fps, "quality": quality,
+        "dual": True,
+    }))
+    await writer.drain()
+
+    last_right = None
+    try:
+        while True:
+            fL = capL.read()
+            fR = capR.read()
+            if fL is None:
+                await asyncio.sleep(delay)
+                continue
+            if fR is not None:
+                last_right = fR
+            fR_send = last_right if last_right is not None else fL  # placeholder
+            # Match heights so the combined frame is rectangular.
+            h = fL.shape[0]
+            if fR_send.shape[0] != h:
+                scale = h / float(fR_send.shape[0])
+                fR_send = cv2.resize(
+                    fR_send,
+                    (int(round(fR_send.shape[1] * scale)), h),
+                    interpolation=cv2.INTER_AREA,
+                )
+            combined = np.hstack([fL, fR_send])
+            ok, buf = cv2.imencode(".jpg", combined, encode_params)
+            if not ok:
+                continue
+            try:
+                _ws_send_bytes(writer, buf.tobytes())
+                await writer.drain()
+            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+                break
+            await asyncio.sleep(delay)
+    finally:
+        capL.close()
+        capR.close()
+
+
 # ---------------------------------------------------------------------------
 # Connection handler
 # ---------------------------------------------------------------------------
@@ -352,6 +429,38 @@ async def _handle_connection(reader: asyncio.StreamReader,
         quality = int(q.get("quality", "80"))
         log.info("stream start: camera=%s fps=%d q=%d", camera_id, fps, quality)
         await _stream_loop(reader, writer, camera_id, fps, quality)
+        writer.close()
+        return
+
+    if method == "GET" and path.startswith("/ws/stream_stereo"):
+        # STEREO_SEPARATE: takes camera_left + camera_right, returns a
+        # side-by-side JPEG stream.
+        writer.write(_ws_handshake_reply(headers))
+        await writer.drain()
+        q = _parse_query(path)
+        cam_left = q.get("camera_left", "")
+        cam_right = q.get("camera_right", "")
+        if not cam_left or not cam_right:
+            _ws_send_text(writer, json.dumps({
+                "type": "error",
+                "message": "camera_left and camera_right are required",
+            }))
+            await writer.drain()
+            writer.close()
+            return
+        if cam_left == cam_right:
+            _ws_send_text(writer, json.dumps({
+                "type": "error",
+                "message": "camera_left and camera_right must differ",
+            }))
+            await writer.drain()
+            writer.close()
+            return
+        fps = int(q.get("fps", "15"))
+        quality = int(q.get("quality", "80"))
+        log.info("stereo stream start: L=%s R=%s fps=%d q=%d",
+                 cam_left, cam_right, fps, quality)
+        await _dual_stream_loop(writer, cam_left, cam_right, fps, quality)
         writer.close()
         return
 

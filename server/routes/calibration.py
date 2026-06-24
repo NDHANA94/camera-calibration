@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 
 from ..core import calibration as calib_core
 from ..core.storage import session_dir
-from ..models.schemas import CalibrationResult, Profile
+from ..models.schemas import CalibrationResult, Chessboard, CameraMode
 from .sessions import finish_session, get_session
 
 router = APIRouter(prefix="/calibrate", tags=["calibrate"])
@@ -31,6 +31,18 @@ def _infer_image_size(sdir: Path) -> Tuple[int, int]:
     return 1280, 720
 
 
+def _load_chessboard_for_session(sdir: Path) -> Chessboard:
+    """Read the chessboard (stored under ``profile`` key in session.json) and
+    normalise legacy fields (``stereo: true`` -> ``mode: stereo_lr``)."""
+    data = json.loads((sdir / "session.json").read_text())
+    cb = dict(data.get("profile") or {})
+    if "mode" not in cb and cb.get("stereo"):
+        cb["mode"] = CameraMode.STEREO_LR.value
+    if "mode" not in cb:
+        cb["mode"] = CameraMode.MONO.value
+    return Chessboard(**cb)
+
+
 @router.post("/{session_id}", response_model=CalibrationResult)
 def run_calibration(session_id: str) -> CalibrationResult:
     info = get_session(session_id)
@@ -38,36 +50,40 @@ def run_calibration(session_id: str) -> CalibrationResult:
         raise HTTPException(400, "Need at least 3 captures before calibrating")
 
     sdir = session_dir(session_id)
-    corners_dir = sdir / "corners"
-    if not corners_dir.exists():
-        raise HTTPException(400, "No captured corner data for this session")
-
-    npy_files = sorted(corners_dir.glob("*.npy"))
-    if len(npy_files) < 3:
-        raise HTTPException(400, "Not enough corner arrays")
-
-    captures: List[np.ndarray] = [np.load(p) for p in npy_files]
+    chessboard = _load_chessboard_for_session(sdir)
 
     # image_size: prefer the metadata file written by the streaming layer.
-    # If it's missing (e.g. an old session), recover from the first PNG frame
-    # under frames/, or fall back to the corners array shape.
     meta_file = sdir / "image_size.json"
     if meta_file.exists():
         image_size = tuple(json.loads(meta_file.read_text())["image_size"])
     else:
         image_size = _infer_image_size(sdir)
-        # Persist so subsequent runs and the UI both see consistent values.
         meta_file.write_text(json.dumps({"image_size": list(image_size)}))
 
-    profile = Profile(**json.loads((sdir / "session.json").read_text())["profile"])
-
     try:
-        meta = calib_core.calibrate(
-            profile=profile,
-            image_size=image_size,
-            captures=captures,
-            out_dir=sdir,
-        )
+        if chessboard.is_stereo:
+            ld = sdir / "corners_left"
+            rd = sdir / "corners_right"
+            lf = sorted(ld.glob("*.npy")) if ld.exists() else []
+            rf = sorted(rd.glob("*.npy")) if rd.exists() else []
+            if len(lf) < 3 or len(rf) < 3:
+                raise HTTPException(400, "Not enough stereo corner pairs (need >= 3)")
+            left = [np.load(p) for p in lf]
+            right = [np.load(p) for p in rf]
+            meta = calib_core.calibrate_stereo(
+                profile=chessboard, image_size=image_size,
+                left_captures=left, right_captures=right, out_dir=sdir,
+            )
+        else:
+            corners_dir = sdir / "corners"
+            npy_files = sorted(corners_dir.glob("*.npy")) if corners_dir.exists() else []
+            if len(npy_files) < 3:
+                raise HTTPException(400, "Not enough corner arrays")
+            captures: List[np.ndarray] = [np.load(p) for p in npy_files]
+            meta = calib_core.calibrate(
+                profile=chessboard, image_size=image_size,
+                captures=captures, out_dir=sdir,
+            )
     except ValueError as exc:
         finish_session(session_id, state="failed")
         raise HTTPException(400, str(exc))
@@ -88,7 +104,7 @@ def run_calibration(session_id: str) -> CalibrationResult:
         reprojection_error=meta["reprojection_error"],
         rms=meta["rms"],
         image_size=meta["image_size"],
-        profile=profile,
+        chessboard=chessboard,
         npz_path=meta["files"]["npz"],
         yaml_path=meta["files"]["yaml"],
         meta_path=meta["files"]["meta"],
@@ -110,11 +126,8 @@ def get_intrinsics(session_id: str) -> dict:
         raise HTTPException(404, "No calibration result — run calibration first")
 
     data = np.load(str(npz_path), allow_pickle=True)
-    K = data["camera_matrix"]
-    dist = data["dist_coeffs"].flatten()
     image_size = [int(x) for x in data["image_size"].tolist()]
     rms = float(data["rms"])
-    reproj = float(data["reprojection_error"])
 
     try:
         meta = json.loads((sdir / "session.json").read_text())
@@ -125,6 +138,40 @@ def get_intrinsics(session_id: str) -> dict:
         name, n_captures, created = session_id, "?", ""
 
     coeff_labels = ["k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6"]
+
+    # Stereo result: render both cameras + relative pose.
+    if "stereo" in data.files and bool(data["stereo"]):
+        def _cam_block(K, dist, label):
+            dl = "\n".join(
+                f"    {coeff_labels[i] if i < len(coeff_labels) else f'c{i}'}: {v:.8f}"
+                for i, v in enumerate(np.asarray(dist).flatten().tolist())
+            )
+            return (
+                f"{label}:\n"
+                f"  camera_matrix:\n"
+                f"    fx: {K[0,0]:.8f}\n    fy: {K[1,1]:.8f}\n"
+                f"    cx: {K[0,2]:.8f}\n    cy: {K[1,2]:.8f}\n"
+                f"  dist_coeffs:\n{dl}\n"
+            )
+        R = np.asarray(data["R"]); T = np.asarray(data["T"]).flatten()
+        baseline = float(data["baseline_mm"]) if "baseline_mm" in data.files else float(np.linalg.norm(T))
+        R_rows = "\n".join("    - [" + ", ".join(f"{v:.8f}" for v in row) + "]" for row in R)
+        yaml_str = (
+            f"# Stereo calibration — {name}  ({created})\n"
+            f"# Pairs: {n_captures}  |  Stereo RMS: {rms:.4f} px  |  Baseline: {baseline:.2f} mm\n\n"
+            f"image_width: {image_size[0]}\nimage_height: {image_size[1]}\n\n"
+            f"{_cam_block(np.asarray(data['K1']), data['D1'], 'left')}\n"
+            f"{_cam_block(np.asarray(data['K2']), data['D2'], 'right')}\n"
+            f"extrinsics:\n"
+            f"  baseline_mm: {baseline:.4f}\n"
+            f"  T_mm: [{T[0]:.6f}, {T[1]:.6f}, {T[2]:.6f}]\n"
+            f"  R:\n{R_rows}\n"
+        )
+        return {"yaml": yaml_str, "name": name, "session_id": session_id}
+
+    K = data["camera_matrix"]
+    dist = data["dist_coeffs"].flatten()
+    reproj = float(data["reprojection_error"])
     dist_lines = "\n".join(
         f"  {coeff_labels[i] if i < len(coeff_labels) else f'c{i}'}: {v:.8f}"
         for i, v in enumerate(dist.tolist())

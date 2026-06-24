@@ -1,14 +1,43 @@
 // sintez-cam-server: vanilla JS frontend.
-// REST for profiles/sessions/cameras; WebSocket for the live frame stream.
+// REST for chessboards/sessions/cameras; WebSocket for the live frame stream.
+//
+// Camera modes:
+//   mono             - 1 camera select, single-frame pipeline
+//   stereo_lr        - 1 camera select, side-by-side L|R pipeline
+//   stereo_separate  - 2 camera selects (left + right), dual pipeline
+//
+// Chessboards (formerly "profiles") are managed through an overlay window:
+// the left panel only contains a select + summary, never the editing fields.
 
 const $ = (id) => document.getElementById(id);
 
 const ui = {
     tabs: document.querySelectorAll(".tab"),
-    localPanel: $("local-panel"),
+    sessionCard: $("session-card"),
     remotePanel: $("remote-panel"),
+    // Camera type + selectors (shared by Local + Remote tabs).
+    // The visible sub-section (local vs remote) is swapped by JS based on
+    // which tab is active; the Camera type dropdown drives both.
+    cameraMode: $("camera-mode"),
+    cameraSection: $("camera-section"),
+    localCameras: $("local-cameras"),
+    remoteCameras: $("remote-cameras"),
+    // Local camera selectors
     cameraSelect: $("local-camera"),
+    cameraLeft: $("local-camera-left"),
+    cameraRight: $("local-camera-right"),
     refreshCameras: $("refresh-cameras"),
+    refreshCameras2: $("refresh-cameras-2"),
+    localCamSingle: $("local-cam-single"),
+    localCamDual: $("local-cam-dual"),
+    // Remote camera selectors
+    remoteCameraSelect: $("remote-camera-select"),
+    remoteCameraLeft: $("remote-camera-left"),
+    remoteCameraRight: $("remote-camera-right"),
+    remoteCamSingle: $("remote-cam-single"),
+    remoteCamDual: $("remote-cam-dual"),
+    refreshRemoteCameras: $("refresh-remote-cameras"),
+    refreshRemoteCameras2: $("refresh-remote-cameras-2"),
     // SSH profiles list + form
     sshProfilesList: $("ssh-profiles-list"),
     sshAddConnection: $("ssh-add-connection"),
@@ -45,32 +74,47 @@ const ui = {
     enableAgentBtn: $("enable-agent-btn"),
     reEnableAgentBtn: $("re-enable-agent-btn"),
     disableAgentBtn: $("disable-agent-btn"),
-    refreshRemoteCameras: $("refresh-remote-cameras"),
-    remoteCameraSelect: $("remote-camera-select"),
-    // Manual token fallback
-    remoteToken: $("remote-token"),
-    issueToken: $("issue-token"),
-    agentCmd: $("agent-cmd"),
-    boardW: $("board-w"),
-    boardH: $("board-h"),
-    squareSize: $("square-size"),
-    requiredCaptures: $("required-captures"),
+    // Chessboard (replaces the old "profile" section in the left panel)
+    chessboardSelect: $("chessboard-select"),
+    chessboardCurrent: $("chessboard-current"),
+    chessboardManage: $("chessboard-manage"),
+    // Session-level controls
     sessionName: $("session-name"),
-    saveProfile: $("save-profile"),
-    deleteProfile: $("delete-profile"),
-    profileSelect: $("profile-select"),
+    requiredCaptures: $("required-captures"),
+    // Capture / abort / finish
     startSession: $("start-session"),
     captureNow: $("capture-now"),
     abortSession: $("abort-session"),
     finishSession: $("finish-session"),
+    // Live / status UI
     canvas: $("preview"),
     statePill: $("state-pill"),
     capturesPill: $("captures-pill"),
     boardPill: $("board-pill"),
     blurPill: $("blur-pill"),
     connPill: $("conn-pill"),
+    bwPill: $("bw-pill"),
+    statusCard: $("status-card"),
+    progressBar: $("progress-bar"),
+    capturedThumbs: $("captured-thumbs"),
+    capturedCount: $("captured-count"),
     hint: $("hint"),
-    result: $("result"),
+    // Chessboard overlay
+    cbOverlay: $("chessboard-overlay"),
+    cbOverlayTitle: $("cb-overlay-title"),
+    cbList: $("chessboard-list"),
+    cbNew: $("chessboard-new"),
+    cbFormPanel: $("chessboard-form-panel"),
+    cbFormHelp: $("chessboard-form-help"),
+    cbName: $("cb-name"),
+    cbMode: $("cb-mode"),
+    cbW: $("cb-w"),
+    cbH: $("cb-h"),
+    cbSquare: $("cb-square"),
+    cbRequired: $("cb-required"),
+    cbSave: $("chessboard-save"),
+    cbDelete: $("chessboard-delete"),
+    cbCancel: $("chessboard-cancel"),
 };
 
 const state = {
@@ -81,12 +125,25 @@ const state = {
     canvasCtx: ui.canvas.getContext("2d"),
     // Remote SSH state
     sshConnected: false,
+    // Name of the SSH profile currently connected (for highlighting the
+    // matching row in the connection list). Empty when not connected.
+    activeSshProfile: null,
+    // Bandwidth tracking for the remote frame stream.  ``bytes`` accumulates
+    // over the last ``bandwidth.windowMs``; the read-side updates every
+    // ``bandwidth.updateMs`` to keep the indicator cheap.
+    bandwidth: { bytes: 0, since: 0, lastSampleBytes: 0, lastSampleTs: 0, bps: 0, timer: null },
     remoteAgentId: null,
     remoteCameras: [],
     remotePollTimer: null,
+    agentHealthTimer: null,
     agentLogSource: null,
     agentCheck: null,   // last {installed, version, latest, needs_update}
-    _editingProfileName: null,
+    _starting: false,
+    // Chessboards (formerly "profiles")
+    chessboards: [],
+    selectedChessboard: null,   // {name, mode, ...} the one currently selected
+    _editingChessboard: null,   // currently open in the overlay
+    _overlayOriginalName: null, // original name when editing (in case the user renames)
 };
 
 // ---------- Tab switching ----------
@@ -95,20 +152,39 @@ ui.tabs.forEach((btn) => {
     btn.addEventListener("click", () => {
         ui.tabs.forEach((b) => b.classList.toggle("active", b === btn));
         state.tab = btn.dataset.tab;
-        ui.localPanel.hidden = state.tab !== "local";
+        // Session card is always visible.  Inside it, swap which camera-pickers
+        // sub-section is shown: Local tab → local cameras, Remote tab →
+        // remote cameras (driven from the agent's enumerated list).
         ui.remotePanel.hidden = state.tab !== "remote";
+        if (ui.localCameras) ui.localCameras.hidden = state.tab !== "local";
+        if (ui.remoteCameras) ui.remoteCameras.hidden = state.tab !== "remote";
+        // Re-apply the single/dual picker visibility for the new sub-section.
+        _applyCameraModeToUI();
     });
 });
 
-// ---------- Status pills ----------
+// ---------- Middle panel views ----------
+function setMiddleView(which) {
+    $("live-view").hidden = which !== "live";
+    $("detail-panel").hidden = which !== "detail";
+    $("middle-placeholder").hidden = which !== "placeholder";
+}
+
+// ---------- Status card ----------
 
 function setState(s) {
     ui.statePill.textContent = s;
     ui.statePill.className = "pill " + (
-        s === "running" ? "ok" :
+        s === "running" ? "warn" :
         s === "finished" ? "ok" :
-        s === "failed" ? "bad" : "warn"
+        s === "failed" ? "bad" : ""
     );
+    ui.statusCard.className = "status-card" + (
+        s === "running" ? " running" :
+        s === "finished" ? " finished" :
+        s === "failed" ? " failed" : ""
+    );
+    updateProgress();
     updateButtons();
 }
 
@@ -118,6 +194,41 @@ function setConn(s) {
     updateButtons();
 }
 
+function updateProgress() {
+    const required = state.session?.required_captures ?? 0;
+    const captures = state.session?.captures ?? 0;
+    ui.capturesPill.textContent = `captures: ${captures} / ${required || "—"}`;
+    const pct = required > 0 ? Math.min(100, Math.round((captures / required) * 100)) : 0;
+    ui.progressBar.style.width = pct + "%";
+    ui.progressBar.classList.toggle("full", required > 0 && captures >= required);
+    ui.capturesPill.className = "pill " + (required > 0 && captures >= required ? "ok" : "");
+}
+
+// ---------- Captured-frame strip ----------
+
+function resetCapturedStrip() {
+    ui.capturedThumbs.innerHTML = '<span class="empty">Captured frames will appear here.</span>';
+    ui.capturedCount.textContent = "0";
+}
+
+function addCapturedThumb(n) {
+    if (!state.session) return;
+    const sid = state.session.id;
+    const idx = String(n - 1).padStart(4, "0");
+    const empty = ui.capturedThumbs.querySelector(".empty");
+    if (empty) empty.remove();
+    const img = document.createElement("img");
+    const url = `/session-data/${sid}/frames/${idx}.png`;
+    img.src = `${url}?t=${Date.now()}`;
+    img.title = `Capture ${n}`;
+    img.loading = "lazy";
+    img.onerror = () => { setTimeout(() => { img.src = `${url}?t=${Date.now()}`; }, 500); };
+    img.onclick = () => window.open(img.src, "_blank");
+    ui.capturedThumbs.appendChild(img);
+    ui.capturedThumbs.scrollLeft = ui.capturedThumbs.scrollWidth;
+    ui.capturedCount.textContent = String(n);
+}
+
 // ---------- Button state management ----------
 
 function updateButtons() {
@@ -125,10 +236,11 @@ function updateButtons() {
     const connected = state.socket !== null;
     const captures = state.session?.captures ?? 0;
 
-    ui.startSession.disabled = running;
+    ui.startSession.disabled = !!state._starting;
+    ui.startSession.textContent = running ? "▶ Restart Capture" : "▶ Start Capture";
     ui.captureNow.disabled = !running || !connected;
-    ui.abortSession.disabled = !state.session;
-    ui.finishSession.disabled = !state.session || captures < 3;
+    ui.abortSession.disabled = !running;
+    ui.finishSession.disabled = !running || captures < 3;
 }
 
 updateButtons();
@@ -154,19 +266,57 @@ async function refreshCameras() {
     try {
         const cams = await api("/cameras");
         state.cameras = cams;
-        ui.cameraSelect.innerHTML = "";
-        cams.forEach((c) => {
-            const opt = document.createElement("option");
-            opt.value = c.id;
-            opt.textContent = c.label;
-            ui.cameraSelect.appendChild(opt);
-        });
+        _populateLocalCameraSelects(cams);
     } catch (err) {
         ui.hint.textContent = "Failed to list cameras: " + err.message;
     }
 }
 
+function _populateLocalCameraSelects(cams) {
+    // Same camera list goes into mono + (left,right) for dual; the user picks.
+    const fill = (sel, preferredId) => {
+        sel.innerHTML = "";
+        if (!cams.length) {
+            const opt = document.createElement("option");
+            opt.value = ""; opt.textContent = "No cameras found"; opt.disabled = true;
+            sel.appendChild(opt);
+            return;
+        }
+        cams.forEach((c) => {
+            const opt = document.createElement("option");
+            opt.value = c.id;
+            opt.textContent = c.label;
+            sel.appendChild(opt);
+        });
+        if (preferredId && cams.some((c) => c.id === preferredId)) sel.value = preferredId;
+        else sel.selectedIndex = 0;
+    };
+    fill(ui.cameraSelect, ui.cameraSelect.value);
+    fill(ui.cameraLeft, ui.cameraLeft.value);
+    fill(ui.cameraRight, ui.cameraRight.value);
+    // Make sure left and right default to DIFFERENT devices so the user
+    // doesn't accidentally calibrate the same camera as both eyes.
+    if (ui.cameraLeft.value === ui.cameraRight.value && cams.length >= 2) {
+        ui.cameraRight.selectedIndex = 1;
+    }
+}
+
 ui.refreshCameras.addEventListener("click", refreshCameras);
+ui.refreshCameras2.addEventListener("click", refreshCameras);
+
+// Camera-type select: show 1 or 2 selectors based on mode.
+function _applyCameraModeToUI() {
+    const isDual = ui.cameraMode.value === "stereo_separate";
+    if (state.tab === "remote") {
+        ui.remoteCamSingle.hidden = isDual;
+        ui.remoteCamDual.hidden = !isDual;
+    } else {
+        ui.localCamSingle.hidden = isDual;
+        ui.localCamDual.hidden = !isDual;
+    }
+}
+ui.cameraMode.addEventListener("change", _applyCameraModeToUI);
+
 refreshCameras();
 
 // ---------- Calibration flags from checkboxes ----------
@@ -179,71 +329,223 @@ function getCalibFlags() {
     return flags;
 }
 
-// ---------- Profiles ----------
+// ---------- Chessboards (the "profile" concept) ----------
 
-async function loadProfiles() {
-    try {
-        const profiles = await api("/profiles");
-        ui.profileSelect.innerHTML = "";
-        const blank = document.createElement("option");
-        blank.value = ""; blank.textContent = "(saved profiles)";
-        ui.profileSelect.appendChild(blank);
-        profiles.forEach((p) => {
-            const opt = document.createElement("option");
-            opt.value = p.name;
-            opt.textContent = `${p.name}  ${p.inner_corners_x}×${p.inner_corners_y}  ${p.square_size_mm}mm  N=${p.required_captures}`;
-            ui.profileSelect.appendChild(opt);
-        });
-    } catch (_) {}
+const MODE_LABEL = {
+    mono: "Mono",
+    stereo_lr: "Stereo L|R",
+    stereo_separate: "Stereo (2 cams)",
+};
+
+function _chessboardSummary(cb) {
+    if (!cb) return '<span class="empty">No chessboard selected.</span>';
+    const m = MODE_LABEL[cb.mode] || cb.mode;
+    return `<strong>${escHtml(cb.name)}</strong>
+            <span class="chess-summary-detail">
+                ${m} &middot; ${cb.inner_corners_x}×${cb.inner_corners_y}
+                &middot; ${cb.square_size_mm} mm
+                &middot; N=${cb.required_captures}
+            </span>`;
 }
 
-// Populate profile fields when the user selects one
-ui.profileSelect.addEventListener("change", async () => {
-    if (!ui.profileSelect.value) return;
+function _renderChessboardCurrent() {
+    ui.chessboardCurrent.innerHTML = _chessboardSummary(state.selectedChessboard);
+}
+
+async function loadChessboards() {
     try {
-        const p = await api(`/profiles/${encodeURIComponent(ui.profileSelect.value)}`);
-        ui.boardW.value = p.inner_corners_x;
-        ui.boardH.value = p.inner_corners_y;
-        ui.squareSize.value = p.square_size_mm;
-        ui.requiredCaptures.value = p.required_captures;
-        ui.sessionName.value = p.name;
-        // Restore calibration flag checkboxes
-        document.querySelectorAll(".calib-flag").forEach((cb) => {
-            cb.checked = (p.flags & parseInt(cb.value, 10)) !== 0;
+        // Try the new endpoint first; fall back to /profiles for old servers.
+        let list;
+        try { list = await api("/chessboards"); }
+        catch (_) { list = await api("/profiles"); }
+        state.chessboards = list;
+        const prevSelection = state.selectedChessboard?.name || ui.chessboardSelect.value;
+        ui.chessboardSelect.innerHTML = "";
+        const blank = document.createElement("option");
+        blank.value = ""; blank.textContent = "(saved chessboards)";
+        ui.chessboardSelect.appendChild(blank);
+        list.forEach((cb) => {
+            const opt = document.createElement("option");
+            opt.value = cb.name;
+            const m = MODE_LABEL[cb.mode] || cb.mode;
+            opt.textContent = `${cb.name}  ·  ${m}  ·  ${cb.inner_corners_x}×${cb.inner_corners_y}  ${cb.square_size_mm}mm  N=${cb.required_captures}`;
+            ui.chessboardSelect.appendChild(opt);
         });
+        if (prevSelection && list.some((c) => c.name === prevSelection)) {
+            ui.chessboardSelect.value = prevSelection;
+            state.selectedChessboard = list.find((c) => c.name === prevSelection);
+        } else if (list.length) {
+            ui.chessboardSelect.selectedIndex = 1;
+            state.selectedChessboard = list[0];
+        } else {
+            state.selectedChessboard = null;
+        }
+        _renderChessboardCurrent();
     } catch (err) {
-        ui.hint.textContent = "Load profile failed: " + err.message;
+        ui.hint.textContent = "Failed to load chessboards: " + err.message;
+    }
+}
+
+ui.chessboardSelect.addEventListener("change", () => {
+    const name = ui.chessboardSelect.value;
+    state.selectedChessboard = state.chessboards.find((c) => c.name === name) || null;
+    _renderChessboardCurrent();
+});
+
+// ---------- Chessboard overlay (open / close / list / edit) ----------
+
+function openChessboardOverlay() {
+    state._editingChessboard = null;
+    state._overlayOriginalName = null;
+    _renderOverlayList();
+    _clearCbForm();
+    _setCbFormHelp("Pick a chessboard from the list, or click + New chessboard.");
+    ui.cbOverlay.hidden = false;
+}
+function closeChessboardOverlay() {
+    ui.cbOverlay.hidden = true;
+    state._editingChessboard = null;
+    state._overlayOriginalName = null;
+}
+window.openChessboardOverlay = openChessboardOverlay;
+window.closeChessboardOverlay = closeChessboardOverlay;
+
+ui.chessboardManage.addEventListener("click", openChessboardOverlay);
+// Click outside the dialog closes it
+ui.cbOverlay.addEventListener("click", (e) => { if (e.target === ui.cbOverlay) closeChessboardOverlay(); });
+// ESC closes the overlay
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !ui.cbOverlay.hidden) closeChessboardOverlay();
+});
+
+function _renderOverlayList() {
+    if (!state.chessboards.length) {
+        ui.cbList.innerHTML = '<div class="cb-list-empty">No chessboards yet — click + New chessboard.</div>';
+        return;
+    }
+    ui.cbList.innerHTML = state.chessboards.map((cb) => {
+        const m = MODE_LABEL[cb.mode] || cb.mode;
+        const active = state._editingChessboard && state._editingChessboard.name === cb.name
+            ? " active" : "";
+        return `
+        <div class="cb-row${active}" data-cb-name="${escHtml(cb.name)}">
+            <div class="cb-row-name">${escHtml(cb.name)}</div>
+            <div class="cb-row-meta">${m} &middot; ${cb.inner_corners_x}×${cb.inner_corners_y} &middot; ${cb.square_size_mm} mm</div>
+        </div>`;
+    }).join("");
+    ui.cbList.querySelectorAll(".cb-row").forEach((row) => {
+        row.addEventListener("click", () => _loadCbIntoForm(row.dataset.cbName));
+    });
+}
+
+function _loadCbIntoForm(name) {
+    const cb = state.chessboards.find((c) => c.name === name);
+    if (!cb) return;
+    state._editingChessboard = cb;
+    state._overlayOriginalName = cb.name;
+    ui.cbName.value = cb.name;
+    ui.cbMode.value = cb.mode || "mono";
+    ui.cbW.value = cb.inner_corners_x;
+    ui.cbH.value = cb.inner_corners_y;
+    ui.cbSquare.value = cb.square_size_mm;
+    ui.cbRequired.value = cb.required_captures;
+    document.querySelectorAll(".cb-flag").forEach((flagCb) => {
+        flagCb.checked = (cb.flags & parseInt(flagCb.value, 10)) !== 0;
+    });
+    _renderOverlayList();   // re-render so the active highlight updates
+    _setCbFormHelp(`Editing <b>${escHtml(cb.name)}</b> — change values and click Save.`);
+}
+
+function _clearCbForm() {
+    ui.cbName.value = "";
+    ui.cbMode.value = "mono";
+    ui.cbW.value = 9; ui.cbH.value = 6;
+    ui.cbSquare.value = 25;
+    ui.cbRequired.value = 20;
+    document.querySelectorAll(".cb-flag").forEach((cb) => (cb.checked = false));
+}
+
+function _setCbFormHelp(html) {
+    ui.cbFormHelp.innerHTML = html;
+}
+
+function _readCbForm() {
+    return {
+        name: sanitizeName(ui.cbName.value),
+        mode: ui.cbMode.value,
+        inner_corners_x: Math.max(2, Math.min(30, parseInt(ui.cbW.value, 10) || 9)),
+        inner_corners_y: Math.max(2, Math.min(30, parseInt(ui.cbH.value, 10) || 6)),
+        square_size_mm: Math.max(0.1, parseFloat(ui.cbSquare.value) || 25),
+        required_captures: Math.max(3, Math.min(200, parseInt(ui.cbRequired.value, 10) || 20)),
+        flags: (() => {
+            let f = 0;
+            document.querySelectorAll(".cb-flag").forEach((cb) => {
+                if (cb.checked) f |= parseInt(cb.value, 10);
+            });
+            return f;
+        })(),
+    };
+}
+
+ui.cbNew.addEventListener("click", () => {
+    state._editingChessboard = null;
+    state._overlayOriginalName = null;
+    _clearCbForm();
+    _renderOverlayList();
+    _setCbFormHelp("New chessboard — fill in the form and click Save.");
+    ui.cbName.focus();
+});
+
+ui.cbSave.addEventListener("click", async () => {
+    const payload = _readCbForm();
+    if (!payload.name) {
+        _setCbFormHelp("Please give the chessboard a name.");
+        return;
+    }
+    try {
+        // Save / overwrite via POST /chessboards/save (or /profiles/save as fallback).
+        const url = state._overlayOriginalName && state._overlayOriginalName !== payload.name
+            ? `/chessboards/${encodeURIComponent(state._overlayOriginalName)}?fallback=1`
+            : "/chessboards/save";
+        let result;
+        try { result = await api(url, { method: "POST", body: JSON.stringify(payload) }); }
+        catch (_) { result = await api("/profiles/save", { method: "POST", body: JSON.stringify(payload) }); }
+        ui.hint.textContent = `Chessboard "${result.name}" saved.`;
+        state._overlayOriginalName = result.name;
+        await loadChessboards();
+        // Re-open the same item so the rename takes effect in the overlay list.
+        _loadCbIntoForm(result.name);
+    } catch (err) {
+        _setCbFormHelp("Save failed: " + err.message);
     }
 });
 
-ui.saveProfile.addEventListener("click", async () => {
-    if (!ui.sessionName.value.trim()) { ui.hint.textContent = "Enter a profile name first."; return; }
-    const profile = currentProfile();
+ui.cbDelete.addEventListener("click", async () => {
+    const name = state._overlayOriginalName;
+    if (!name) {
+        _setCbFormHelp("Pick a chessboard from the list to delete.");
+        return;
+    }
+    if (!confirm(`Delete chessboard "${name}"?`)) return;
     try {
-        await api("/profiles/save", { method: "POST", body: JSON.stringify(profile) });
-        ui.sessionName.value = profile.name;   // reflect sanitized name back
-        ui.hint.textContent = `Profile "${profile.name}" saved.`;
-        loadProfiles();
+        try { await api(`/chessboards/${encodeURIComponent(name)}`, { method: "DELETE" }); }
+        catch (_) { await api(`/profiles/${encodeURIComponent(name)}`, { method: "DELETE" }); }
+        ui.hint.textContent = `Chessboard "${name}" deleted.`;
+        state._editingChessboard = null;
+        state._overlayOriginalName = null;
+        _clearCbForm();
+        await loadChessboards();
+        _renderOverlayList();
+        _setCbFormHelp("Pick a chessboard from the list, or click + New chessboard.");
     } catch (err) {
-        ui.hint.textContent = "Save failed: " + err.message;
+        _setCbFormHelp("Delete failed: " + err.message);
     }
 });
 
-ui.deleteProfile.addEventListener("click", async () => {
-    const name = ui.profileSelect.value || ui.sessionName.value.trim();
-    if (!name) { ui.hint.textContent = "Select a profile to delete."; return; }
-    if (!confirm(`Delete profile "${name}"?`)) return;
-    try {
-        await api(`/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
-        ui.hint.textContent = `Profile "${name}" deleted.`;
-        loadProfiles();
-    } catch (err) {
-        ui.hint.textContent = "Delete failed: " + err.message;
-    }
-});
+ui.cbCancel.addEventListener("click", closeChessboardOverlay);
 
 // Auto-load on page start
-loadProfiles();
+loadChessboards();
 
 // ---------- Sessions ----------
 
@@ -251,58 +553,151 @@ function sanitizeName(raw) {
     return (raw || "").trim().replace(/[^A-Za-z0-9_.\-]+/g, "_").replace(/^_+|_+$/g, "") || "default";
 }
 
-function currentProfile() {
+// Auto-generate a session name from camera type + chessboard config so users
+// who leave the field blank still get something meaningful and unique-ish.
+// Format:  <mode>_<WxH>_<mm>mm_YYYY-MM-DD_HH-MM
+function _autoSessionName(mode, cb) {
+    if (!cb) return sanitizeName(`${mode}_session_${Date.now()}`);
+    const ts = new Date();
+    const yyyy = ts.getFullYear();
+    const mm = String(ts.getMonth() + 1).padStart(2, "0");
+    const dd = String(ts.getDate()).padStart(2, "0");
+    const hh = String(ts.getHours()).padStart(2, "0");
+    const mi = String(ts.getMinutes()).padStart(2, "0");
+    return sanitizeName(
+        `${mode}_${cb.inner_corners_x}x${cb.inner_corners_y}_${cb.square_size_mm}mm_${yyyy}-${mm}-${dd}_${hh}-${mi}`
+    );
+}
+
+// What the user intends to do, normalised into the structure the API expects.
+function _currentChessboard() {
+    // Either a saved chessboard is selected, or we fall back to defaults so
+    // the API still gets a sensible payload (this matches the old behaviour).
+    const selected = state.selectedChessboard;
+    const mode = _isDualMode() ? "stereo_separate" : (_isStereoLr() ? "stereo_lr" : "mono");
+    if (selected) {
+        return {
+            name: selected.name,
+            mode,
+            // Pull the live advanced-option state so the user's current
+            // checkbox + captures-count tweaks apply even when a saved
+            // chessboard is selected.  This matches the old UX where the
+            // form fields overrode the saved profile values.
+            inner_corners_x: selected.inner_corners_x,
+            inner_corners_y: selected.inner_corners_y,
+            square_size_mm: selected.square_size_mm,
+            flags: getCalibFlags(),
+            required_captures: Math.max(3, Math.min(200, parseInt(ui.requiredCaptures.value, 10) || selected.required_captures || 20)),
+        };
+    }
     return {
-        name: sanitizeName(ui.sessionName.value),
-        inner_corners_x: parseInt(ui.boardW.value, 10),
-        inner_corners_y: parseInt(ui.boardH.value, 10),
-        square_size_mm: parseFloat(ui.squareSize.value),
+        name: "default",
+        mode,
+        inner_corners_x: 9, inner_corners_y: 6,
+        square_size_mm: 25.0,
         flags: getCalibFlags(),
         required_captures: Math.max(3, Math.min(200, parseInt(ui.requiredCaptures.value, 10) || 20)),
     };
 }
 
+function _isDualMode() {
+    return ui.cameraMode && ui.cameraMode.value === "stereo_separate";
+}
+function _isStereoLr() {
+    return ui.cameraMode && ui.cameraMode.value === "stereo_lr";
+}
+function _activeMode() {
+    if (_isDualMode()) return "stereo_separate";
+    if (_isStereoLr()) return "stereo_lr";
+    return "mono";
+}
+
 // Combined create + start: one button does it all.
 ui.startSession.addEventListener("click", async () => {
-    if (state.session?.state === "running") return;
-
-    if (state.tab === "remote") {
-        await _remoteStartCapture();
-        return;
-    }
-
-    const profile = currentProfile();
-    const body = {
-        name: profile.name,
-        source: "local",
-        camera_id: ui.cameraSelect.value,
-        profile,
-    };
-    let info;
+    if (state._starting) return;
+    state._starting = true;
+    updateButtons();
     try {
-        info = await api("/sessions", { method: "POST", body: JSON.stringify(body) });
-    } catch (err) {
-        ui.hint.textContent = "Failed to create session: " + err.message;
-        return;
-    }
-    state.session = info;
-    try {
-        info = await api(`/sessions/${state.session.id}/start`, { method: "POST" });
+        if (state.session && state.session.state === "running") {
+            disconnectStream();
+            try { await api(`/sessions/${state.session.id}/abort`, { method: "POST" }); }
+            catch (_) {}
+            state.session = null;
+        }
+
+        if (state.tab === "remote") {
+            await _remoteStartCapture();
+            return;
+        }
+
+        // Local path
+        const chessboard = _currentChessboard();
+        if (!state.selectedChessboard) {
+            ui.hint.textContent = "Select a chessboard first (or create one in Manage …).";
+            return;
+        }
+        // Validate camera selection per mode.
+        let cameraId = null, cameraId2 = null;
+        if (_isDualMode()) {
+            cameraId = ui.cameraLeft.value;
+            cameraId2 = ui.cameraRight.value;
+            if (!cameraId || !cameraId2) {
+                ui.hint.textContent = "Select LEFT and RIGHT cameras.";
+                return;
+            }
+            if (cameraId === cameraId2) {
+                ui.hint.textContent = "LEFT and RIGHT cameras must be different devices.";
+                return;
+            }
+        } else {
+            cameraId = ui.cameraSelect.value;
+            if (!cameraId) { ui.hint.textContent = "No camera selected."; return; }
+        }
+
+        const explicitName = ui.sessionName.value.trim();
+        const finalName = explicitName || _autoSessionName(_activeMode(), chessboard);
+        const body = {
+            name: finalName,
+            source: "local",
+            camera_id: cameraId,
+            camera_id_2: cameraId2,
+            chessboard,
+        };
+        let info;
+        try {
+            info = await api("/sessions", { method: "POST", body: JSON.stringify(body) });
+        } catch (err) {
+            ui.hint.textContent = "Failed to create session: " + err.message;
+            return;
+        }
         state.session = info;
-        setState(info.state);
-        ui.capturesPill.textContent = `captures: 0 / ${info.required_captures}`;
-        ui.hint.textContent = `Session started — need ${info.required_captures} captures. Hold the chessboard in view.`;
-        connectStream();
-        loadSessionList();
-    } catch (err) {
-        ui.hint.textContent = "Start failed: " + err.message;
+        try {
+            info = await api(`/sessions/${state.session.id}/start`, { method: "POST" });
+            state.session = info;
+            ui.hint.style.borderColor = "";
+            resetCapturedStrip();
+            setMiddleView("live");
+            setState(info.state);
+            ui.hint.textContent = `Session started — need ${info.required_captures} captures. Hold the chessboard in view.`;
+            connectStream();
+            loadSessionList();
+        } catch (err) {
+            ui.hint.textContent = "Start failed: " + err.message;
+        }
+    } finally {
+        state._starting = false;
+        updateButtons();
     }
 });
 
-// Manual force-capture
 ui.captureNow.addEventListener("click", () => {
-    if (!state.socket) return;
-    try { state.socket.send(JSON.stringify({ type: "capture_now" })); } catch (_) {}
+    if (state.tab === "remote") {
+        if (!state.session) return;
+        api(`/sessions/${state.session.id}/capture-now`, { method: "POST" }).catch(() => {});
+    } else {
+        if (!state.socket) return;
+        try { state.socket.send(JSON.stringify({ type: "capture_now" })); } catch (_) {}
+    }
     ui.hint.textContent = "Force capture requested…";
 });
 
@@ -317,6 +712,7 @@ ui.abortSession.addEventListener("click", async () => {
         state.session = info;
         setState(info.state);
         disconnectStream();
+        setMiddleView("placeholder");
         ui.hint.textContent = "Session aborted.";
         loadSessionList();
     } catch (err) {
@@ -324,47 +720,88 @@ ui.abortSession.addEventListener("click", async () => {
     }
 });
 
-ui.finishSession.addEventListener("click", async () => {
-    if (!state.session) return;
+ui.finishSession.addEventListener("click", () => finishAndCalibrate(false));
+
+let _finishing = false;
+async function finishAndCalibrate(auto) {
+    if (!state.session || _finishing) return;
+    _finishing = true;
     _stopCameraPoll();
     disconnectStream();
+    ui.hint.textContent = auto
+        ? "Required captures reached — calculating calibration…"
+        : "Calculating calibration…";
+    const sid = state.session.id;
     try {
-        const result = await api(`/calibrate/${state.session.id}`, { method: "POST" });
-        showResult(result);
+        await api(`/calibrate/${sid}`, { method: "POST" });
         state.session = { ...state.session, state: "finished" };
         setState("finished");
         loadSessionList();
+        await renderSessionDetail(sid);
+        ui.hint.textContent = "Calibration complete.";
+        ui.hint.style.borderColor = "";
     } catch (err) {
         ui.hint.textContent = "Calibration failed: " + err.message;
+        ui.hint.style.borderColor = "var(--danger)";
         setState("failed");
+        setMiddleView("placeholder");
+    } finally {
+        _finishing = false;
     }
-});
-
-function showResult(r) {
-    const sid = state.session?.id ?? "";
-    ui.result.hidden = false;
-    ui.result.innerHTML = `
-        <strong>Calibration complete.</strong><br/>
-        RMS: <code>${r.rms.toFixed(4)}</code> &nbsp;
-        Mean reprojection error: <code>${r.reprojection_error.toFixed(4)} px</code><br/>
-        Image size: <code>${r.image_size.join(" × ")} px</code><br/>
-        <span style="color:var(--muted);font-size:11px">
-            Files saved: result.npz, result.yaml, meta.json
-        </span>
-        ${sid ? `<br/><button class="secondary small" style="margin-top:8px" onclick="openSessionDir('${sid}')">Open result directory</button>` : ""}
-    `;
 }
 
 // ---------- Stream ----------
 
 function disconnectStream() {
     if (state.socket) {
-        // WebSocket vs EventSource -- both have .close()
         try { state.socket.send(JSON.stringify({ type: "stop" })); } catch (_) {}
         try { state.socket.close(); } catch (_) {}
         state.socket = null;
     }
     setConn("disconnected");
+    _stopBandwidthMeter();
+}
+
+// ---------- Bandwidth meter (remote stream only) ----------
+// Counts bytes received over the SSE frame stream and shows them in the
+// "bw-pill" pill at the top of the right panel.  Updates at 1 Hz so the
+// cost is negligible; the byte counter is incremented in the SSE onmessage
+// handler above (one increment per frame, O(1)).
+function _startBandwidthMeter() {
+    const bw = state.bandwidth;
+    bw.bytes = 0;
+    bw.since = Date.now();
+    bw.lastSampleBytes = 0;
+    bw.lastSampleTs = bw.since;
+    bw.bps = 0;
+    const pill = $("bw-pill");
+    if (pill) { pill.hidden = false; pill.textContent = "0 B/s"; }
+    _stopBandwidthMeter();
+    bw.timer = setInterval(() => {
+        const now = Date.now();
+        const dt = (now - bw.lastSampleTs) / 1000;
+        const dBytes = bw.bytes - bw.lastSampleBytes;
+        bw.bps = dt > 0 ? dBytes / dt : 0;
+        bw.lastSampleBytes = bw.bytes;
+        bw.lastSampleTs = now;
+        const pill = $("bw-pill");
+        if (pill) pill.textContent = _formatBandwidth(bw.bps);
+    }, 1000);
+}
+
+function _stopBandwidthMeter() {
+    const bw = state.bandwidth;
+    if (bw.timer) { clearInterval(bw.timer); bw.timer = null; }
+    bw.bytes = 0; bw.bps = 0; bw.lastSampleBytes = 0; bw.lastSampleTs = 0;
+    const pill = $("bw-pill");
+    if (pill) { pill.hidden = true; pill.textContent = "— B/s"; }
+}
+
+function _formatBandwidth(bps) {
+    if (!bps || bps <= 0) return "0 B/s";
+    if (bps < 1024) return `${bps.toFixed(0)} B/s`;
+    if (bps < 1024 * 1024) return `${(bps / 1024).toFixed(1)} KB/s`;
+    return `${(bps / 1024 / 1024).toFixed(2)} MB/s`;
 }
 
 function connectStream() {
@@ -374,14 +811,21 @@ function connectStream() {
     setConn("connecting");
 
     if (state.tab === "local") {
-        // Local camera: still a raw WebSocket, frames come as binary JPEGs.
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
         const url = `${proto}//${location.host}/ws/local/${sid}`;
         const ws = new WebSocket(url);
         ws.binaryType = "arraybuffer";
         state.socket = ws;
         ws.onopen = () => { setConn("connected"); updateButtons(); };
-        ws.onclose = () => { setConn("disconnected"); state.socket = null; updateButtons(); };
+        ws.onclose = () => {
+            setConn("disconnected");
+            state.socket = null;
+            if (!_finishing && state.session && state.session.state === "running") {
+                state.session = { ...state.session, state: "idle" };
+                setState("idle");
+            }
+            updateButtons();
+        };
         ws.onerror = () => { setConn("disconnected"); };
         ws.onmessage = (ev) => {
             if (typeof ev.data === "string") {
@@ -392,15 +836,22 @@ function connectStream() {
         };
     } else {
         // Remote camera: SSE proxy of the agent's frame stream.
-        // Frames are base64-encoded JPEGs sent as JSON messages.
         const es = new EventSource(`/remote/stream/${sid}`);
         state.socket = es;
-        es.onopen = () => { setConn("connected"); updateButtons(); };
-        es.onerror = () => { setConn("disconnected"); };
+        es.onopen = () => {
+            setConn("connected");
+            updateButtons();
+            _startBandwidthMeter();
+        };
+        es.onerror = () => { setConn("disconnected"); _stopBandwidthMeter(); };
         es.onmessage = (ev) => {
             try {
                 const msg = JSON.parse(ev.data);
                 if (msg.type === "frame") {
+                    // Count the payload bytes for the bandwidth indicator.
+                    // (Includes the base64-expanded size, which is close to
+                    // the actual data rate and cheap to compute.)
+                    state.bandwidth.bytes += (msg.data || "").length;
                     const bin = atob(msg.data);
                     const buf = new Uint8Array(bin.length);
                     for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
@@ -415,15 +866,17 @@ function connectStream() {
 
 function handleEvent(msg) {
     if (msg.type === "capture") {
-        const total = state.session?.required_captures ?? "—";
-        ui.capturesPill.textContent = `captures: ${msg.n} / ${total}`;
-        ui.capturesPill.className = "pill ok";
         if (state.session) {
             state.session.captures = msg.n;
+            updateProgress();
             updateButtons();
+            addCapturedThumb(msg.n);
+            const required = state.session.required_captures ?? 0;
+            if (required > 0 && msg.n >= required) {
+                finishAndCalibrate(true);
+            }
         }
     } else if (msg.type === "status") {
-        // Board detection + blur from pipeline (sent every ~10 frames)
         ui.boardPill.textContent = `board: ${msg.board ? "OK" : "NO"}`;
         ui.boardPill.className = "pill " + (msg.board ? "ok" : "bad");
         ui.blurPill.textContent = `blur: ${msg.blur}`;
@@ -461,13 +914,32 @@ async function loadSessionList() {
     } catch (_) {}
 }
 
+// Format an ISO timestamp into "YYYY-MM-DD HH:MM" in the user's local zone
+// for the history list.  Sessions often span seconds; we keep seconds for
+// the title tooltip and a coarser date in the visible row.
+function _formatTimestamp(iso) {
+    if (!iso) return "";
+    let s = iso;
+    if (s.endsWith("Z")) s = s.slice(0, -1) + "+00:00";
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return iso;
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 function renderSessionList(sessions, health = {}) {
     const el = $("sessions-list");
     if (!sessions || !sessions.length) {
         el.innerHTML = '<span class="session-empty">No sessions yet.</span>';
         return;
     }
-    sessions.sort((a, b) => (b.created_at ?? b.id).localeCompare(a.created_at ?? a.id));
+    // Sort latest first.  created_at is ISO-8601 UTC and sorts lexically,
+    // but fall back to id for legacy sessions that lack it.
+    sessions.sort((a, b) => {
+        const ta = a.created_at || a.id;
+        const tb = b.created_at || b.id;
+        return tb.localeCompare(ta);
+    });
     el.innerHTML = sessions.map((s) => {
         const h = health[s.id] ?? {};
         const healthBadge = h.label
@@ -480,6 +952,10 @@ function renderSessionList(sessions, health = {}) {
         const paramsLine = p.inner_corners_x != null
             ? `<span class="session-params">${p.inner_corners_x} × ${p.inner_corners_y} corners &nbsp;·&nbsp; ${p.square_size_mm} mm &nbsp;·&nbsp; ${s.captures} / ${s.required_captures} captures</span>`
             : `<span class="session-params">${s.captures} / ${s.required_captures} captures</span>`;
+        const when = _formatTimestamp(s.created_at);
+        const whenHtml = when
+            ? `<span class="session-when" title="${escHtml(s.created_at || s.id)}">${escHtml(when)}</span>`
+            : "";
         return `
         <div class="session-row" id="srow-${s.id}">
             <div class="session-row-top">
@@ -494,7 +970,10 @@ function renderSessionList(sessions, health = {}) {
                     <button class="danger small" onclick="confirmDeleteSession('${s.id}', '${escHtml(s.name)}')">Delete</button>
                 </div>
             </div>
-            ${paramsLine}
+            <div class="session-row-bottom">
+                ${whenHtml}
+                ${paramsLine}
+            </div>
         </div>`;
     }).join("");
 }
@@ -533,7 +1012,6 @@ function _lbKey(e) {
     else if (e.key === "ArrowRight") lightboxNav(1);
 }
 
-// Close on backdrop click
 $("lightbox").addEventListener("click", (e) => { if (e.target === $("lightbox")) closeLightbox(); });
 
 // ---------- Session detail viewer ----------
@@ -549,30 +1027,51 @@ function decodeFlags(flags) {
     return active.length ? active.join(", ") : `0x${n.toString(16)}`;
 }
 
-async function viewSession(sessionId) {
-    if (_activeIntrinsicsId === sessionId) { closeDetail(); return; }
+function _modeLabel(mode) {
+    if (!mode) return "Mono";
+    if (mode === "stereo_separate") return "Stereo (2 cameras)";
+    if (mode === "stereo_lr") return "Stereo L | R";
+    return "Mono";
+}
+
+function viewSession(sessionId) {
+    if (_activeIntrinsicsId === sessionId && !$("detail-panel").hidden) {
+        closeDetail();
+        return;
+    }
+    renderSessionDetail(sessionId);
+}
+
+async function renderSessionDetail(sessionId) {
     _activeIntrinsicsId = sessionId;
 
     document.querySelectorAll(".session-row").forEach((r) => r.classList.remove("active"));
     const row = $(`srow-${sessionId}`);
     if (row) row.classList.add("active");
 
-    const panel = $("detail-panel");
     $("detail-title").textContent = "Loading…";
     $("detail-body").innerHTML = "";
     $("copy-intrinsics").hidden = true;
-    panel.hidden = false;
-    panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    setMiddleView("detail");
 
     try {
         const detail = await api(`/sessions/${sessionId}/detail`);
         $("detail-title").textContent = `Session — ${detail.name}`;
 
         const p = detail.profile ?? {};
-        const created = (detail.created_at ?? "").replace("T", "  ").slice(0, 19);
+        const created = _formatTimestamp(detail.created_at);
+        const mode = _modeLabel(p.mode);
 
-        // --- Board params section ---
-        let html = `
+        let html = "";
+        if (detail.state === "finished" && detail.rms != null) {
+            html += `<div class="result-banner">✓ <strong>Calibration complete${p.is_stereo || (p.mode && p.mode !== 'mono') ? " (stereo)" : ""}.</strong>
+                &nbsp; ${mode} RMS: <code>${Number(detail.rms).toFixed(4)}</code>
+                &nbsp; <button class="secondary small" onclick="openSessionDir('${sessionId}')">Open result folder</button></div>`;
+        } else if (detail.state === "failed") {
+            html += `<div class="result-banner failed">⚠ Calibration failed for this session.</div>`;
+        }
+
+        html += `
         <div class="detail-section">
             <div class="detail-section-title">Chessboard &amp; capture settings</div>
             <div class="detail-kv">
@@ -585,15 +1084,15 @@ async function viewSession(sessionId) {
                 <span class="lbl">Calib flags</span>
                 <span class="val">${escHtml(decodeFlags(p.flags))}</span>
                 <span class="lbl">Source</span>
-                <span class="val">${detail.source}${detail.camera_id ? " · " + escHtml(detail.camera_id) : ""}</span>
+                <span class="val">${detail.source}${detail.camera_id ? " · " + escHtml(detail.camera_id) : ""}${detail.camera_id_2 ? " + " + escHtml(detail.camera_id_2) : ""}</span>
+                <span class="lbl">Mode</span>
+                <span class="val">${mode}</span>
                 <span class="lbl">Created</span>
                 <span class="val">${created || "—"}</span>
             </div>
         </div>`;
 
-        // --- Captured frames grid ---
         if (detail.frames && detail.frames.length > 0) {
-            // Store for lightbox access
             _lbFrames = detail.frames;
             _lbSessionId = sessionId;
             const thumbs = detail.frames.map((f, i) =>
@@ -610,7 +1109,6 @@ async function viewSession(sessionId) {
 
         $("detail-body").innerHTML = html;
 
-        // --- Intrinsics YAML (finished sessions only) ---
         if (detail.state === "finished") {
             try {
                 const intr = await api(`/calibrate/${sessionId}/intrinsics`);
@@ -630,9 +1128,9 @@ async function viewSession(sessionId) {
 }
 
 function closeDetail() {
-    $("detail-panel").hidden = true;
     document.querySelectorAll(".session-row").forEach((r) => r.classList.remove("active"));
     _activeIntrinsicsId = null;
+    setMiddleView(state.session?.state === "running" ? "live" : "placeholder");
 }
 
 $("copy-intrinsics").addEventListener("click", () => {
@@ -650,7 +1148,7 @@ $("copy-intrinsics").addEventListener("click", () => {
 });
 
 function escHtml(s) {
-    return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 async function openSessionDir(id) {
@@ -670,7 +1168,7 @@ async function confirmDeleteSession(id, name) {
         if (state.session?.id === id) {
             disconnectStream();
             state.session = null;
-            ui.result.hidden = true;
+            setMiddleView("placeholder");
             setState("idle");
             ui.capturesPill.textContent = "captures: 0 / —";
             ui.boardPill.textContent = "board: —";
@@ -684,11 +1182,10 @@ async function confirmDeleteSession(id, name) {
     }
 }
 
-// Load session list on page start and keep it up to date
 loadSessionList();
 
 // ==========================================================================
-// SSH Profile management
+// SSH Profile management (kept identical to previous behavior)
 // ==========================================================================
 
 async function loadSshProfiles() {
@@ -698,34 +1195,49 @@ async function loadSshProfiles() {
     if (!profiles.length) {
         ui.sshProfilesList.innerHTML =
             '<div style="font-size:12px;color:var(--muted);padding:4px 0">No saved connections</div>';
+        return;
     }
     profiles.forEach((p) => {
         const row = document.createElement("div");
-        row.className = "row";
+        row.className = "ssh-profile-row row";
         row.dataset.profileRow = p.name;
-        row.style.cssText =
-            "align-items:center;gap:4px;margin-bottom:4px;border:1px solid var(--border);border-radius:3px;padding:4px 6px";
+        if (state.activeSshProfile === p.name) row.classList.add("ssh-profile-active");
         row.innerHTML = `
-            <span style="flex:1;font-size:13px">
+            <span class="ssh-profile-label">
                 <strong>${escHtml(p.name)}</strong>
-                <span style="color:var(--muted);font-size:11px"> ${escHtml(p.username)}@${escHtml(p.host)}</span>
+                <span class="ssh-profile-meta">${escHtml(p.username)}@${escHtml(p.host)}</span>
             </span>
-            <button class="secondary small" data-profile-use="${escHtml(p.name)}" title="Select this connection">Use</button>
-            <button class="secondary small" data-profile-edit="${escHtml(p.name)}">Edit</button>
-            <button class="danger small" data-profile-del="${escHtml(p.name)}">Del</button>
+            <button class="ssh-profile-btn ssh-profile-icon"
+                    data-profile-toggle="${escHtml(p.name)}"
+                    title="${state.activeSshProfile === p.name ? "Disconnect" : "Connect"}"
+                    aria-label="${state.activeSshProfile === p.name ? "Disconnect" : "Connect"}">
+                ${state.activeSshProfile === p.name ? "⏻" : "⏻"}
+            </button>
+            <button class="ssh-profile-btn ssh-profile-icon ssh-profile-edit"
+                    data-profile-edit="${escHtml(p.name)}" title="Edit" aria-label="Edit">✎</button>
+            <button class="ssh-profile-btn ssh-profile-icon ssh-profile-del"
+                    data-profile-del="${escHtml(p.name)}" title="Delete" aria-label="Delete">🗑</button>
         `;
         ui.sshProfilesList.appendChild(row);
     });
 
-    ui.sshProfilesList.querySelectorAll("[data-profile-use]").forEach((btn) => {
+    ui.sshProfilesList.querySelectorAll("[data-profile-toggle]").forEach((btn) => {
         btn.addEventListener("click", async () => {
-            const name = btn.dataset.profileUse;
+            const name = btn.dataset.profileToggle;
+            // If the user clicked the toggle for the currently-active profile
+            // (or the global SSH is connected), disconnect.
+            if (state.sshConnected) {
+                _sshDisconnect();
+                return;
+            }
+            // Otherwise fill the form from this profile and connect.
             let all; try { all = await api("/remote/ssh-profiles"); } catch (_) { return; }
             const p = all.find((x) => x.name === name); if (!p) return;
             _fillForm(p);
-            _highlightProfile(name);
-            ui.sshToggleConn.disabled = false;
-            ui.hint.textContent = `"${name}" selected — press Connect.`;
+            state.activeSshProfile = p.name;
+            await _sshConnect();
+            // Re-render so the row gets the active highlight + Connect icon flips.
+            await loadSshProfiles();
         });
     });
 
@@ -768,8 +1280,11 @@ function _openForm() { ui.sshFormPanel.hidden = false; ui.sshProfileName.focus()
 function _closeForm() { ui.sshFormPanel.hidden = true; state._editingProfileName = null; }
 
 function _highlightProfile(name) {
+    // Apply the active highlight class to the matching row.  The class itself
+    // is styled in styles.css; this function exists for callers that don't
+    // want to re-render the whole list (e.g. focus changes).
     ui.sshProfilesList.querySelectorAll("[data-profile-row]").forEach((row) => {
-        row.style.borderColor = row.dataset.profileRow === name ? "var(--accent, #4a90e2)" : "var(--border)";
+        row.classList.toggle("ssh-profile-active", row.dataset.profileRow === name);
     });
 }
 
@@ -836,8 +1351,45 @@ function _resetRemoteState() {
     state.remoteAgentId = null;
     state.remoteCameras = [];
     _stopCameraPoll();
+    _stopAgentHealthPoll();
     _stopAgentLog();
     if (ui.agentLog) { ui.agentLog.textContent = ""; ui.agentLog.hidden = true; }
+}
+
+// ---------- Agent heartbeat poll ----------
+
+function _stopAgentHealthPoll() {
+    if (state.agentHealthTimer) { clearInterval(state.agentHealthTimer); state.agentHealthTimer = null; }
+}
+
+function _startAgentHealthPoll(agentId) {
+    _stopAgentHealthPoll();
+    state.agentHealthTimer = setInterval(async () => {
+        if (state.remoteAgentId !== agentId) { _stopAgentHealthPoll(); return; }
+        let s;
+        try {
+            s = await api(`/remote/agent/${agentId}/status`);
+        } catch (_) {
+            return;
+        }
+        if (s.down) {
+            _stopAgentHealthPoll();
+            _onAgentDown(s.reason || "The remote agent went down.");
+        }
+    }, 5000);
+}
+
+function _onAgentDown(reason) {
+    _stopCameraPoll();
+    disconnectStream();
+    if (state.session && state.session.state === "running" && state.tab === "remote") {
+        setState("failed");
+        setMiddleView("placeholder");
+    }
+    state.remoteAgentId = null;
+    _showAgentPanel("agent-installed-panel");
+    ui.hint.textContent = "⚠ Agent down: " + reason + " Re-enable to continue.";
+    ui.hint.style.borderColor = "var(--danger)";
 }
 
 // ---------- SSH Connect / Disconnect toggle ----------
@@ -866,18 +1418,27 @@ async function _sshConnect() {
         ui.sshConnectedPanel.hidden = true;
         state.sshConnected = false;
         ui.sshToggleConn.textContent = "⇄ Connect";
+        state.activeSshProfile = null;
     } finally {
         ui.sshToggleConn.disabled = false;
+        // Reflect the new connection state in the saved-connections list
+        // (highlights the active row, swaps Connect/Disconnect icons).
+        await loadSshProfiles();
     }
 }
 
 function _sshDisconnect() {
     _resetRemoteState();
     state.sshConnected = false;
+    state.activeSshProfile = null;
     ui.sshConnectedPanel.hidden = true;
     _showAgentPanel(null);
     ui.sshToggleConn.textContent = "⇄ Connect";
     ui.hint.textContent = "Disconnected.";
+    // Drop the active highlight + bandwidth display.
+    _highlightProfile(null);
+    _stopBandwidthMeter();
+    loadSshProfiles();
 }
 
 // ---------- Agent install-state rendering ----------
@@ -889,7 +1450,6 @@ function _renderAgentInstallState(check) {
         ui.hint.textContent = "Agent not installed. Install it to continue.";
         return;
     }
-    // Installed: show version + optional update banner.
     const ver = check.version || "unknown";
     ui.agentVersionPill.hidden = false;
     ui.agentVersionPill.textContent = `v${ver}`;
@@ -915,8 +1475,6 @@ async function _recheckAgent() {
     }
 }
 
-// Run an SSE endpoint that streams {message} lines; resolves true if a
-// "DONE:" line was seen.  Used by install / reinstall / remove.
 async function _runSseJob(url, logEl) {
     logEl.hidden = false;
     logEl.textContent = "";
@@ -956,8 +1514,6 @@ async function _runSseJob(url, logEl) {
     return success;
 }
 
-// ---------- Install Agent (SSE stream) ----------
-
 ui.installAgentBtn.addEventListener("click", async () => {
     ui.installAgentBtn.disabled = true;
     ui.hint.textContent = "Installing agent …";
@@ -966,8 +1522,6 @@ ui.installAgentBtn.addEventListener("click", async () => {
     if (ok) { await _recheckAgent(); }
     else { ui.hint.textContent = "Installation failed — see log above."; }
 });
-
-// ---------- Reinstall / Update Agent ----------
 
 ui.reinstallAgentBtn.addEventListener("click", async () => {
     ui.reinstallAgentBtn.disabled = true;
@@ -979,8 +1533,6 @@ ui.reinstallAgentBtn.addEventListener("click", async () => {
     if (ok) { await _recheckAgent(); ui.hint.textContent = "Agent reinstalled."; }
     else { ui.hint.textContent = "Reinstall failed — see log above."; }
 });
-
-// ---------- Remove Agent ----------
 
 ui.removeAgentBtn.addEventListener("click", async () => {
     if (!confirm("Remove the agent from the remote device?")) return;
@@ -1005,13 +1557,9 @@ ui.removeAgentBtn.addEventListener("click", async () => {
 function _appendAgentLog(line) {
     ui.agentLog.hidden = false;
     if (line === "__READY__") {
-        // Marker from the server: the existing log has been replayed and
-        // we're now following new lines.  Insert a visible separator so
-        // the user can tell historical from live output.
         ui.agentLog.textContent += "── live tail ──\n";
     } else {
         ui.agentLog.textContent += line + "\n";
-        // Keep the log bounded to the last ~400 lines so it doesn't grow forever.
         const lines = ui.agentLog.textContent.split("\n");
         if (lines.length > 450) {
             ui.agentLog.textContent = lines.slice(lines.length - 400).join("\n");
@@ -1045,14 +1593,11 @@ function _startAgentLog(agentId) {
 }
 
 async function _doEnableAgent() {
-    // If an agent is already running (e.g. "Restart Agent"), disable it first
-    // so it releases the port before we launch a fresh one.
     if (state.remoteAgentId) {
         try {
             await api("/remote/ssh-disable", {
                 method: "POST", body: JSON.stringify({ agent_id: state.remoteAgentId }),
             });
-            // Give the old process a moment to exit and release the port.
             await new Promise((r) => setTimeout(r, 1000));
         } catch (_) { /* best-effort */ }
     }
@@ -1098,7 +1643,6 @@ async function _doDisableAgent() {
     }
     ui.disableAgentBtn.disabled = false;
     _resetRemoteState();
-    // Re-check so the installed panel reflects current version/state.
     await _recheckAgent();
     ui.hint.textContent = "Agent disabled.";
 }
@@ -1109,29 +1653,45 @@ ui.disableAgentBtn.addEventListener("click", _doDisableAgent);
 
 function _populateCameraSelect(cameras) {
     state.remoteCameras = cameras || [];
-    ui.remoteCameraSelect.innerHTML = "";
-    if (!cameras || cameras.length === 0) {
-        const opt = document.createElement("option");
-        opt.value = ""; opt.textContent = "No cameras found"; opt.disabled = true;
-        ui.remoteCameraSelect.appendChild(opt);
-        return false;
+    // Same list into single + left + right.
+    const fill = (sel, preferredId) => {
+        sel.innerHTML = "";
+        if (!cameras || cameras.length === 0) {
+            const opt = document.createElement("option");
+            opt.value = ""; opt.textContent = "No cameras found"; opt.disabled = true;
+            sel.appendChild(opt);
+            return false;
+        }
+        cameras.forEach((c) => {
+            const opt = document.createElement("option");
+            opt.value = c.id;
+            opt.textContent = c.label || c.id;
+            sel.appendChild(opt);
+        });
+        if (preferredId && cameras.some((c) => c.id === preferredId)) sel.value = preferredId;
+        else sel.selectedIndex = 0;
+        return true;
+    };
+    fill(ui.remoteCameraSelect, ui.remoteCameraSelect.value);
+    fill(ui.remoteCameraLeft, ui.remoteCameraLeft.value);
+    fill(ui.remoteCameraRight, ui.remoteCameraRight.value);
+    // Make LEFT != RIGHT by default so the user doesn't accidentally bind the
+    // same camera to both eyes.
+    if (ui.remoteCameraLeft.value === ui.remoteCameraRight.value && state.remoteCameras.length >= 2) {
+        ui.remoteCameraRight.selectedIndex = 1;
     }
-    cameras.forEach((c) => {
-        const opt = document.createElement("option");
-        opt.value = c.id;
-        opt.textContent = c.label || c.id;
-        ui.remoteCameraSelect.appendChild(opt);
-    });
-    return true;
+    return cameras && cameras.length > 0;
 }
 
 async function _refreshRemoteCameras() {
     if (!state.remoteAgentId) return;
     ui.refreshRemoteCameras.disabled = true;
+    ui.refreshRemoteCameras2.disabled = true;
     ui.hint.textContent = "Re-scanning remote cameras …";
     try {
         const r = await api(`/remote/agent/${state.remoteAgentId}/cameras?refresh=1`);
         const any = _populateCameraSelect(r.cameras);
+        _applyCameraModeToUI();
         ui.hint.textContent = any
             ? "Camera list refreshed — select a camera, then press ▶ Start Capture."
             : "No cameras found on remote.";
@@ -1139,10 +1699,12 @@ async function _refreshRemoteCameras() {
         ui.hint.textContent = "Refresh failed: " + err.message;
     } finally {
         ui.refreshRemoteCameras.disabled = false;
+        ui.refreshRemoteCameras2.disabled = false;
     }
 }
 
 ui.refreshRemoteCameras.addEventListener("click", _refreshRemoteCameras);
+ui.refreshRemoteCameras2.addEventListener("click", _refreshRemoteCameras);
 
 // ---------- Camera list polling ----------
 
@@ -1156,15 +1718,15 @@ function _startCameraPoll(agentId) {
             if (r.connected) {
                 _stopCameraPoll();
                 const any = _populateCameraSelect(r.cameras);
+                _applyCameraModeToUI();
                 ui.hint.textContent = any
                     ? "Agent running — select a camera, then press ▶ Start Capture."
                     : "Agent connected — no cameras found on remote.";
+                ui.hint.style.borderColor = "";
                 _showAgentPanel("agent-running-panel");
+                _startAgentHealthPoll(agentId);
                 return;
             }
-            // r.connected is false: could be the explicit "pending" state
-            // (server issued token but agent hasn't WS-connected yet) — show
-            // an informative hint instead of staying silent.
             if (r.pending && attempts % 5 === 1) {
                 ui.hint.textContent =
                     `Agent process started (id ${agentId.slice(0, 8)}…) — ` +
@@ -1172,15 +1734,13 @@ function _startCameraPoll(agentId) {
                     "Check the agent log below if this takes more than ~10 s.";
             }
         } catch (err) {
-            // Only surface a hint on the first failure and then every 10 polls
-            // to avoid spamming the user while we keep retrying.
             if (attempts === 1 || attempts % 10 === 0) {
                 ui.hint.textContent =
                     `Polling agent failed (${err.message}). ` +
                     "Check the agent log below.";
             }
         }
-        if (attempts >= 60) { // 60 × 2 s = 2 min
+        if (attempts >= 60) {
             _stopCameraPoll();
             _showAgentPanel("agent-installed-panel");
             ui.hint.textContent =
@@ -1201,16 +1761,39 @@ async function _remoteStartCapture() {
         ui.hint.textContent = "Enable the remote agent first.";
         return;
     }
-    const cameraId = ui.remoteCameraSelect.value;
-    if (!cameraId) { ui.hint.textContent = "Select a remote camera first."; return; }
+    const chessboard = _currentChessboard();
+    if (!state.selectedChessboard) {
+        ui.hint.textContent = "Select a chessboard first (or create one in Manage …).";
+        return;
+    }
+    let cameraId = null, cameraId2 = null;
+    if (_isDualMode()) {
+        cameraId = ui.remoteCameraLeft.value;
+        cameraId2 = ui.remoteCameraRight.value;
+        if (!cameraId || !cameraId2) {
+            ui.hint.textContent = "Select LEFT and RIGHT cameras.";
+            return;
+        }
+        if (cameraId === cameraId2) {
+            ui.hint.textContent = "LEFT and RIGHT cameras must be different devices.";
+            return;
+        }
+    } else {
+        cameraId = ui.remoteCameraSelect.value;
+        if (!cameraId) { ui.hint.textContent = "Select a remote camera first."; return; }
+    }
 
-    // Create + start session
-    const profile = currentProfile();
+    const explicitName = ui.sessionName.value.trim();
+    const finalName = explicitName || _autoSessionName(_activeMode(), chessboard);
+
     let info;
     try {
         info = await api("/sessions", {
             method: "POST",
-            body: JSON.stringify({ name: profile.name, source: "remote", camera_id: null, profile }),
+            body: JSON.stringify({
+                name: finalName, source: "remote",
+                camera_id: null, camera_id_2: null, chessboard,
+            }),
         });
         state.session = info;
         info = await api(`/sessions/${state.session.id}/start`, { method: "POST" });
@@ -1220,41 +1803,24 @@ async function _remoteStartCapture() {
         return;
     }
 
-    // Bind agent → session + camera (triggers streaming)
     try {
         await api(`/remote/agent/${state.remoteAgentId}/bind`, {
             method: "POST",
-            body: JSON.stringify({ session_id: state.session.id, camera_id: cameraId }),
+            body: JSON.stringify({
+                session_id: state.session.id,
+                camera_id: cameraId,
+                camera_id_2: cameraId2,
+            }),
         });
     } catch (err) {
         ui.hint.textContent = "Failed to bind camera: " + err.message;
         return;
     }
 
+    resetCapturedStrip();
+    setMiddleView("live");
     setState(info.state);
-    ui.capturesPill.textContent = `captures: 0 / ${info.required_captures}`;
     ui.hint.textContent = `Remote calibration started — need ${info.required_captures} captures.`;
     connectStream();
     loadSessionList();
 }
-
-// ---------- Manual token fallback ----------
-
-ui.issueToken.addEventListener("click", async () => {
-    if (!state.session) {
-        const profile = currentProfile();
-        const body = { name: profile.name, source: "remote", camera_id: null, profile };
-        try {
-            state.session = await api("/sessions", { method: "POST", body: JSON.stringify(body) });
-        } catch (err) { ui.hint.textContent = err.message; return; }
-    }
-    try {
-        const t = await api(`/remote/${state.session.id}/token`, { method: "POST" });
-        ui.remoteToken.value = t.token;
-        ui.agentCmd.textContent = t.agent_command;
-        ui.hint.textContent = "Run the agent command on the remote machine, then press Start Capture.";
-        updateButtons();
-    } catch (err) {
-        ui.hint.textContent = "Token issue failed: " + err.message;
-    }
-});

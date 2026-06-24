@@ -22,6 +22,7 @@ from fastapi import APIRouter, HTTPException
 
 from ..core.storage import session_dir, session_frames_dir
 from ..models.schemas import (
+    CameraMode,
     Profile,
     SessionCreate,
     SessionInfo,
@@ -33,6 +34,21 @@ router = APIRouter(prefix="/sessions", tags=["sessions"])
 
 # In-memory index of sessions for fast lookup. Source of truth is the filesystem.
 _INDEX: Dict[str, dict] = {}
+
+
+def _migrate_legacy_chessboard(cb: dict) -> dict:
+    """Add ``mode`` to a chessboard dict loaded from disk if it's missing.
+
+    Older session.json / profile.json files only have ``stereo: true``; map
+    that onto the new enum so legacy sessions keep working.
+    """
+    if "mode" in cb:
+        return cb
+    if cb.get("stereo"):
+        cb["mode"] = CameraMode.STEREO_LR.value
+    else:
+        cb["mode"] = CameraMode.MONO.value
+    return cb
 
 
 def _new_session_id() -> str:
@@ -55,7 +71,11 @@ def _load_index_from_disk() -> None:
         rec = _record_path(d.name)
         if rec.exists():
             try:
-                _INDEX[d.name] = json.loads(rec.read_text())
+                data = json.loads(rec.read_text())
+                # Migrate legacy chessboards that lack a ``mode`` field.
+                if "profile" in data and isinstance(data["profile"], dict):
+                    _migrate_legacy_chessboard(data["profile"])
+                _INDEX[d.name] = data
             except Exception:
                 continue
 
@@ -77,6 +97,14 @@ def list_sessions() -> List[SessionInfo]:
 def create_session(payload: SessionCreate) -> SessionInfo:
     if payload.source == SessionSource.LOCAL and not payload.camera_id:
         raise HTTPException(400, "camera_id required for local sessions")
+    if payload.chessboard.mode.value == "stereo_separate":
+        if not payload.camera_id_2:
+            raise HTTPException(
+                400,
+                "camera_id_2 required when chessboard mode is stereo_separate",
+            )
+        if payload.camera_id_2 == payload.camera_id:
+            raise HTTPException(400, "camera_id and camera_id_2 must differ")
     sid = _new_session_id()
     session_dir(sid).mkdir(parents=True, exist_ok=True)
     session_frames_dir(sid).mkdir(parents=True, exist_ok=True)
@@ -85,13 +113,17 @@ def create_session(payload: SessionCreate) -> SessionInfo:
         "name": payload.name,
         "source": payload.source,
         "camera_id": payload.camera_id,
+        "camera_id_2": payload.camera_id_2,
         "state": SessionState.IDLE,
         "captures": 0,
-        "required_captures": payload.profile.required_captures,
+        "required_captures": payload.chessboard.required_captures,
         "reprojection_error": None,
         "result_files": [],
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "profile": payload.profile.model_dump(),
+        # On-disk the chessboard is stored under the legacy "profile" key so
+        # existing session.json files remain readable.  The new frontend uses
+        # the same JSON; only the API surface (Chessboard vs Profile) changed.
+        "profile": payload.chessboard.model_dump(),
     }
     _INDEX[sid] = rec
     _persist(sid)

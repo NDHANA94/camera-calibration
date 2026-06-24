@@ -91,11 +91,18 @@ class AgentState:
     # Set by bind_session() once user picks a camera and starts calibration
     start_event: asyncio.Event = field(default_factory=asyncio.Event)
     start_camera_id: Optional[str] = None
+    # Second camera id (STEREO_SEPARATE only).  When set, the remote stream
+    # uses the agent's /ws/stream_stereo endpoint.
+    start_camera_id_2: Optional[str] = None
     session_id: Optional[str] = None
     # Browser WebSocket watching the remote feed (populated by /ws/watch)
     viewer_ws: Optional[WebSocket] = None
     # Port the agent is listening on (default 8765)
     agent_port: int = 8765
+    # Heartbeat: monotonic time of the last successful agent health check, and
+    # the background task that runs the heartbeat loop.
+    last_heartbeat: float = 0.0
+    heartbeat_task: object = None
 
 
 class RemoteAgentRegistry:
@@ -117,6 +124,12 @@ class RemoteAgentRegistry:
         # re-send credentials.  Cleared when the agent disconnects or
         # after PENDING_TTL_S.
         self._creds: Dict[str, dict] = {}
+        # agent_id -> {"reason", "ts"} for agents that went DOWN unexpectedly
+        # (heartbeat lost), so the status endpoint can tell the UI the agent
+        # died vs. was never started.  Reaped after DOWN_TTL_S.
+        self._down: Dict[str, dict] = {}
+
+    DOWN_TTL_S = 300.0
 
     # -- Token lifecycle --
 
@@ -157,6 +170,7 @@ class RemoteAgentRegistry:
             agent_port=agent_port, process=process,
         )
         self._agents[agent_id] = state
+        self._down.pop(agent_id, None)
         return state
 
     def unregister(self, agent_id: str) -> None:
@@ -164,6 +178,12 @@ class RemoteAgentRegistry:
         if state:
             if state.session_id:
                 self._by_session.pop(state.session_id, None)
+            # Stop the heartbeat loop for this agent.
+            try:
+                if state.heartbeat_task is not None:
+                    state.heartbeat_task.cancel()
+            except Exception:
+                pass
             # Ask the remote agent process to stop promptly.  Closing the SSH
             # connection below would also kill it via SIGHUP, but terminate()
             # is a clean, immediate signal.
@@ -201,6 +221,26 @@ class RemoteAgentRegistry:
         self._gc_pending()
         return self._agents.get(agent_id)
 
+    def mark_down(self, agent_id: str, reason: str) -> None:
+        """Record that an agent went down unexpectedly (heartbeat lost) and
+        tear it down.  The status endpoint reports this so the UI can flip the
+        agent back to 'not running' and let the user re-enable."""
+        if agent_id in self._agents or agent_id in self._issued:
+            self._down[agent_id] = {
+                "reason": reason, "ts": asyncio.get_event_loop().time(),
+            }
+        self._issued.pop(agent_id, None)
+        self.unregister(agent_id)
+
+    def down_info(self, agent_id: str) -> Optional[dict]:
+        """Return {'reason', 'ts'} if this agent went down recently, else None."""
+        now = asyncio.get_event_loop().time()
+        stale = [aid for aid, d in self._down.items()
+                 if (now - d["ts"]) > self.DOWN_TTL_S]
+        for aid in stale:
+            self._down.pop(aid, None)
+        return self._down.get(agent_id)
+
     def is_issued(self, agent_id: str) -> bool:
         """True iff this agent_id was issued (and the pending entry hasn't
         expired). Lets callers distinguish "agent never started" from
@@ -214,13 +254,24 @@ class RemoteAgentRegistry:
 
     # -- Session binding (fires streaming) --
 
-    def bind_session(self, agent_id: str, session_id: str, camera_id: str) -> None:
-        """Associate agent with a session and trigger camera streaming."""
+    def bind_session(
+        self,
+        agent_id: str,
+        session_id: str,
+        camera_id: str,
+        camera_id_2: Optional[str] = None,
+    ) -> None:
+        """Associate agent with a session and trigger camera streaming.
+
+        For STEREO_SEPARATE pass a second camera id; the remote stream will
+        then open /ws/stream_stereo instead of /ws/stream.
+        """
         state = self._agents.get(agent_id)
         if state is None:
             raise KeyError(f"No agent with id {agent_id!r}")
         state.session_id = session_id
         state.start_camera_id = camera_id
+        state.start_camera_id_2 = camera_id_2
         self._by_session[session_id] = agent_id
         state.start_event.set()
 

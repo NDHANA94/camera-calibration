@@ -12,18 +12,36 @@ from typing import Dict, Optional
 
 import numpy as np
 
-from .frame_pipeline import Pipeline
+from .frame_pipeline import DualCameraPipeline, Pipeline, StereoPipeline
+from ..models.schemas import CameraMode, Chessboard
+
+
+def _select_pipeline(chessboard: Chessboard):
+    """Pick the right pipeline class for a chessboard's mode."""
+    if chessboard.mode == CameraMode.MONO:
+        return Pipeline
+    if chessboard.mode == CameraMode.STEREO_LR:
+        return StereoPipeline
+    if chessboard.mode == CameraMode.STEREO_SEPARATE:
+        return DualCameraPipeline
+    # Fallback to mono
+    return Pipeline
 
 
 class SessionRuntime:
-    def __init__(self, session_id: str, profile) -> None:
+    def __init__(self, session_id: str, chessboard: Chessboard) -> None:
         self.session_id = session_id
-        self.pipeline = Pipeline(
-            board_w=profile.inner_corners_x,
-            board_h=profile.inner_corners_y,
-            required_captures=getattr(profile, "required_captures", 15),
+        self.chessboard = chessboard
+        # Backward-compat: ``stereo`` reflects any stereo mode.
+        self.stereo = chessboard.is_stereo
+        self.mode = chessboard.mode
+        pipeline_cls = _select_pipeline(chessboard)
+        self.pipeline = pipeline_cls(
+            board_w=chessboard.inner_corners_x,
+            board_h=chessboard.inner_corners_y,
+            required_captures=getattr(chessboard, "required_captures", 15),
         )
-        self.profile = profile
+        self.profile = chessboard  # legacy attribute name preserved
         self.frame_queue: "asyncio.Queue[bytes]" = asyncio.Queue(maxsize=2)
         self.event_queue: "asyncio.Queue[dict]" = asyncio.Queue(maxsize=64)
         self.image_size: Optional[tuple[int, int]] = None
@@ -64,9 +82,9 @@ _runtimes_lock = asyncio.Lock()
 async def get_runtime(session_id: str) -> SessionRuntime:
     async with _runtimes_lock:
         if session_id not in _runtimes:
-            from .sessions_helpers import load_profile_for_session
-            profile = load_profile_for_session(session_id)
-            _runtimes[session_id] = SessionRuntime(session_id, profile)
+            from .sessions_helpers import load_chessboard_for_session
+            cb = load_chessboard_for_session(session_id)
+            _runtimes[session_id] = SessionRuntime(session_id, cb)
         return _runtimes[session_id]
 
 

@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from .core.storage import SESSIONS_DIR, STATIC_DIR, ensure_dirs
 from .routes.calibration import router as calibration_router
 from .routes.cameras import router as cameras_router
-from .routes.profiles import router as profiles_router
+from .routes.profiles import router_chessboards, router_profiles
 from .routes.remote_ssh import router as remote_ssh_router
 from .routes.sessions import router as sessions_router
 from .routes.stream import router as stream_router
@@ -26,7 +26,10 @@ app = FastAPI(title="Sintez Camera Calibration", version="0.1.0")
 ensure_dirs()
 
 app.include_router(cameras_router)
-app.include_router(profiles_router)
+# Both /profiles (legacy alias) and /chessboards (new canonical) are mounted
+# so older clients keep working while new ones use the new prefix.
+app.include_router(router_chessboards)
+app.include_router(router_profiles)
 app.include_router(sessions_router)
 app.include_router(calibration_router)
 app.include_router(stream_router)

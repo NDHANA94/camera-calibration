@@ -57,76 +57,26 @@ async def _process_and_dispatch(
     *,
     out_ws: Optional[WebSocket] = None,
     force_capture: bool = False,
-) -> None:
-    """Process one frame through the per-session pipeline.
+) -> bool:
+    """Process one frame through the per-session pipeline (mono or stereo).
 
-    Saves corners to disk. If *out_ws* is given, also sends the JPEG and
-    event messages to it (the browser). When *out_ws* is None the frame is
-    still processed/saved — it just isn't streamed anywhere.
-    """
-    from ..core.sessions_helpers import bump_capture
-    from ..core.storage import session_dir
+    Saves corners to disk via the shared core. If *out_ws* is given, also
+    sends the annotated JPEG and event messages to it (the browser).
 
-    force = force_capture or getattr(runtime, "force_capture", False)
-    if getattr(runtime, "force_capture", False):
-        runtime.force_capture = False
+    Returns False if the viewer socket failed (disconnected) so the caller can
+    stop the loop and release the camera; True otherwise."""
+    from ..core.stream_processing import process_frame
 
-    from ..core.frame_pipeline import FrameResult  # noqa: F401  (type hint only)
-    result = runtime.pipeline.process(
-        frame_bgr,
-        hint_fn=lambda caps: coverage_tip(caps),
-        force_capture=force,
-    )
-    if result.capture_taken and runtime.image_size is None:
-        runtime.image_size = (result.width, result.height)
-
-    # Stream JPEG to browser (if watching)
-    if out_ws is not None:
-        try:
-            await out_ws.send_bytes(result.jpeg)
-        except Exception:
-            out_ws = None  # viewer disconnected — keep processing
-
-    sdir = session_dir(runtime.session_id)
-    if runtime.image_size is None:
-        runtime.image_size = (result.width, result.height)
-        (sdir / "image_size.json").write_text(
-            json.dumps({"image_size": list(runtime.image_size)})
-        )
-
-    if result.capture_taken:
-        corners_dir = sdir / "corners"
-        corners_dir.mkdir(parents=True, exist_ok=True)
-        idx = len(list(corners_dir.glob("*.npy")))
-        np.save(corners_dir / f"{idx:04d}.npy", result.corners)
-        try:
-            cv2.imwrite(str(sdir / "frames" / f"{idx:04d}.png"), frame_bgr)
-        except Exception:
-            pass
-        runtime.captures_count += 1
-        bump_capture(runtime.session_id)
-        if out_ws is not None:
-            await _send_json(out_ws, {
-                "type": "capture",
-                "n": runtime.captures_count,
-                "blur": round(result.blur_score, 1),
-            })
-
-    runtime._frame_count = getattr(runtime, "_frame_count", 0) + 1
-    fc = runtime._frame_count
+    jpeg, events = process_frame(runtime, frame_bgr, force_capture=force_capture)
 
     if out_ws is not None:
-        if fc % 10 == 0:
-            await _send_json(out_ws, {
-                "type": "status",
-                "board": result.board_found,
-                "blur": round(result.blur_score, 1),
-            })
-        if fc % 60 == 0 or result.capture_taken:
-            await _send_json(out_ws, {
-                "type": "hint",
-                "message": coverage_tip(runtime.pipeline.captures),
-            })
+        try:
+            await out_ws.send_bytes(jpeg)
+            for ev in events:
+                await out_ws.send_text(json.dumps(ev))
+        except Exception:
+            return False  # viewer disconnected
+    return True
 
 
 async def _recv_commands(ws: WebSocket, runtime) -> None:
@@ -165,13 +115,18 @@ async def _local_loop(ws: WebSocket, session_id: str, camera_id: str) -> None:
     cmd_task = asyncio.create_task(_recv_commands(ws, runtime))
     try:
         while True:
-            if getattr(runtime, "aborted", False):
+            # Stop (and release the camera) on abort or when the browser
+            # disconnects -- otherwise the loop would spin forever holding the
+            # camera, which also blocks camera enumeration for everyone else.
+            if getattr(runtime, "aborted", False) or cmd_task.done():
                 break
             frame = cap.read()
             if frame is None:
                 await asyncio.sleep(0.02)
                 continue
-            await _process_and_dispatch(runtime, frame, out_ws=ws)
+            ok = await _process_and_dispatch(runtime, frame, out_ws=ws)
+            if not ok:
+                break  # viewer disconnected
             await asyncio.sleep(0.0)
     except WebSocketDisconnect:
         pass
@@ -181,6 +136,57 @@ async def _local_loop(ws: WebSocket, session_id: str, camera_id: str) -> None:
     finally:
         cmd_task.cancel()
         cap.close()
+        await drop_runtime(session_id)
+
+
+async def _local_dual_loop(
+    ws: WebSocket,
+    session_id: str,
+    camera_id_left: str,
+    camera_id_right: str,
+) -> None:
+    """Local loop for STEREO_SEPARATE: open two cameras, sync their frames,
+    feed the (left, right) pair into :class:`DualCameraPipeline`."""
+    runtime = await get_runtime(session_id)
+    capL = CameraCapture(camera_id_left)
+    capR = CameraCapture(camera_id_right)
+    try:
+        capL.open()
+        capR.open()
+    except Exception as exc:
+        try: capL.close()
+        except Exception: pass
+        try: capR.close()
+        except Exception: pass
+        await _send_json(ws, {"type": "error", "message": str(exc)})
+        await ws.close()
+        return
+
+    cmd_task = asyncio.create_task(_recv_commands(ws, runtime))
+    try:
+        while True:
+            if getattr(runtime, "aborted", False) or cmd_task.done():
+                break
+            fL = capL.read()
+            fR = capR.read()
+            # If either side is missing, skip this round; the dual pipeline
+            # also degrades gracefully when given a None pair.
+            if fL is None or fR is None:
+                await asyncio.sleep(0.02)
+                continue
+            ok = await _process_and_dispatch(runtime, (fL, fR), out_ws=ws)
+            if not ok:
+                break
+            await asyncio.sleep(0.0)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.exception("Local dual stream error: %s", exc)
+        await _send_json(ws, {"type": "error", "message": str(exc)})
+    finally:
+        cmd_task.cancel()
+        capL.close()
+        capR.close()
         await drop_runtime(session_id)
 
 
@@ -246,6 +252,56 @@ async def _remote_loop(ws: WebSocket, session_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# WebSocket routes
+# ---------------------------------------------------------------------------
+
+@router.websocket("/ws/local/{session_id}")
+async def ws_local(ws: WebSocket, session_id: str) -> None:
+    """Local-camera streaming.  The browser opens this; the server reads the
+    local camera, runs the pipeline, and streams annotated JPEGs back.
+
+    For sessions whose chessboard mode is STEREO_SEPARATE this dispatches to
+    the dual-camera loop, which opens TWO cameras and feeds paired frames
+    into :class:`DualCameraPipeline`."""
+    await ws.accept()
+    from .sessions import get_session
+    try:
+        info = get_session(session_id)
+        camera_id = info.camera_id
+        camera_id_2 = info.camera_id_2
+    except Exception:
+        await _send_json(ws, {"type": "error", "message": "Session not found"})
+        await ws.close()
+        return
+    if not camera_id:
+        await _send_json(ws, {"type": "error", "message": "No camera configured for this session"})
+        await ws.close()
+        return
+    # Inspect the chessboard mode to pick mono / dual.
+    try:
+        from ..models.schemas import CameraMode
+        from ..core.sessions_helpers import load_chessboard_for_session
+        cb = load_chessboard_for_session(session_id)
+        if cb.mode == CameraMode.STEREO_SEPARATE and camera_id_2:
+            await _local_dual_loop(ws, session_id, camera_id, camera_id_2)
+            return
+    except Exception:
+        pass
+    await _local_loop(ws, session_id, camera_id)
+
+
+@router.websocket("/ws/remote/{session_id}")
+async def ws_remote(ws: WebSocket, session_id: str) -> None:
+    """Legacy manual-agent streaming: an agent the user launched by hand
+    connects here with a one-time token."""
+    token = ws.query_params.get("token", "")
+    sid = registry.consume(token) if token else None
+    if not sid or sid != session_id:
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    registry.register(session_id, ws)
+    await _remote_loop(ws, session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +309,16 @@ async def _remote_loop(ws: WebSocket, session_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 from fastapi import Request  # noqa: E402
+
+
+@router.post("/sessions/{session_id}/capture-now")
+async def capture_now_rest(session_id: str) -> dict:
+    """Force-capture the next good frame.  Used by the remote (SSE) flow,
+    whose one-way stream can't carry a WebSocket ``capture_now`` command."""
+    from ..core.runtime import get_runtime
+    runtime = await get_runtime(session_id)
+    runtime.force_capture = True
+    return {"ok": True}
 
 
 @router.post("/remote/{session_id}/token")

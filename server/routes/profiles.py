@@ -1,4 +1,14 @@
-"""CRUD for saved calibration profiles stored under server/data/profiles/."""
+"""CRUD for saved chessboard (calibration parameter) sets stored under
+``server/data/profiles/``.
+
+Conceptually a "chessboard" stores:
+  - the physical board (inner corners W×H, square size)
+  - calibration flags
+  - which camera-mode the board is meant for (mono / stereo L|R / stereo separate)
+
+Endpoints are exposed under BOTH ``/profiles`` (legacy alias) and
+``/chessboards`` (new canonical name).  Both serve the same JSON files on disk.
+"""
 from __future__ import annotations
 
 import json
@@ -9,74 +19,113 @@ from typing import List
 from fastapi import APIRouter, HTTPException
 
 from ..core.storage import profile_path
-from ..models.schemas import Profile, ProfileCreate, ProfileUpdate
+from ..models.schemas import Chessboard, ChessboardUpdate
 
-router = APIRouter(prefix="/profiles", tags=["profiles"])
+# Both prefixes are exposed so old + new clients work.  ``/profiles`` is the
+# legacy alias; ``/chessboards`` is the canonical new name.
+router_profiles = APIRouter(prefix="/profiles", tags=["profiles"])
+router_chessboards = APIRouter(prefix="/chessboards", tags=["chessboards"])
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
 
 
-@router.get("", response_model=List[Profile])
-def list_profiles() -> List[Profile]:
-    out: List[Profile] = []
-    for p in sorted(Path(profile_path("__nope__")).parent.glob("*.json")):
+def _load_chessboard_from_disk(path: Path) -> Chessboard:
+    data = json.loads(path.read_text())
+    # Legacy files may have `stereo: true` instead of `mode: stereo_lr`.  Map
+    # that into the new enum so older profiles keep working.
+    if "mode" not in data and data.get("stereo"):
+        data["mode"] = "stereo_lr"
+    if "mode" not in data:
+        data["mode"] = "mono"
+    return Chessboard(**data)
+
+
+def _list() -> List[Chessboard]:
+    out: List[Chessboard] = []
+    base = profile_path("__nope__").parent
+    for p in sorted(base.glob("*.json")):
         try:
-            data = json.loads(p.read_text())
-            out.append(Profile(**data))
+            out.append(_load_chessboard_from_disk(p))
         except Exception:
             continue
     return out
 
 
-@router.post("", response_model=Profile, status_code=201)
-def create_profile(payload: ProfileCreate) -> Profile:
-    if not _SAFE_NAME.match(payload.name):
-        raise HTTPException(400, "Invalid profile name")
-    path = profile_path(payload.name)
-    if path.exists():
-        raise HTTPException(409, "Profile already exists")
-    profile = Profile(**payload.model_dump())
-    path.write_text(profile.model_dump_json(indent=2))
-    return profile
-
-
-@router.post("/save", response_model=Profile)
-def save_profile(payload: ProfileCreate) -> Profile:
-    """Create-or-overwrite a profile. Used by the UI's 'Save' button."""
+def _save(payload: Chessboard) -> Chessboard:
     if not _SAFE_NAME.match(payload.name):
         raise HTTPException(
             400,
-            f"Invalid profile name '{payload.name}'. "
+            f"Invalid chessboard name '{payload.name}'. "
             "Use only letters, digits, underscores, hyphens, or dots (no spaces).",
         )
     path = profile_path(payload.name)
-    profile = Profile(**payload.model_dump())
-    path.write_text(profile.model_dump_json(indent=2))
-    return profile
+    path.write_text(payload.model_dump_json(indent=2))
+    return payload
 
 
-@router.get("/{name}", response_model=Profile)
-def get_profile(name: str) -> Profile:
+# --- list --------------------------------------------------------------------
+
+@router_profiles.get("", response_model=List[Chessboard])
+@router_chessboards.get("", response_model=List[Chessboard])
+def list_chessboards() -> List[Chessboard]:
+    return _list()
+
+
+# --- create ------------------------------------------------------------------
+
+@router_profiles.post("", response_model=Chessboard, status_code=201)
+@router_chessboards.post("", response_model=Chessboard, status_code=201)
+def create_chessboard(payload: Chessboard) -> Chessboard:
+    if not _SAFE_NAME.match(payload.name):
+        raise HTTPException(400, "Invalid chessboard name")
+    path = profile_path(payload.name)
+    if path.exists():
+        raise HTTPException(409, "Chessboard already exists")
+    return _save(payload)
+
+
+# --- create-or-overwrite -----------------------------------------------------
+
+@router_profiles.post("/save", response_model=Chessboard)
+@router_chessboards.post("/save", response_model=Chessboard)
+def save_chessboard(payload: Chessboard) -> Chessboard:
+    """Create-or-overwrite a chessboard. Used by the UI's Save button."""
+    return _save(payload)
+
+
+# --- get ---------------------------------------------------------------------
+
+@router_profiles.get("/{name}", response_model=Chessboard)
+@router_chessboards.get("/{name}", response_model=Chessboard)
+def get_chessboard(name: str) -> Chessboard:
     path = profile_path(name)
     if not path.exists():
-        raise HTTPException(404, "Profile not found")
-    return Profile(**json.loads(path.read_text()))
+        raise HTTPException(404, "Chessboard not found")
+    return _load_chessboard_from_disk(path)
 
 
-@router.put("/{name}", response_model=Profile)
-def update_profile(name: str, payload: ProfileUpdate) -> Profile:
+# --- update (PATCH) ----------------------------------------------------------
+
+@router_profiles.put("/{name}", response_model=Chessboard)
+@router_chessboards.put("/{name}", response_model=Chessboard)
+@router_profiles.patch("/{name}", response_model=Chessboard)
+@router_chessboards.patch("/{name}", response_model=Chessboard)
+def update_chessboard(name: str, payload: ChessboardUpdate) -> Chessboard:
     path = profile_path(name)
     if not path.exists():
-        raise HTTPException(404, "Profile not found")
-    current = Profile(**json.loads(path.read_text()))
+        raise HTTPException(404, "Chessboard not found")
+    current = _load_chessboard_from_disk(path)
     updated = current.model_copy(update=payload.model_dump(exclude_none=True))
     path.write_text(updated.model_dump_json(indent=2))
     return updated
 
 
-@router.delete("/{name}", status_code=204)
-def delete_profile(name: str) -> None:
+# --- delete ------------------------------------------------------------------
+
+@router_profiles.delete("/{name}", status_code=204)
+@router_chessboards.delete("/{name}", status_code=204)
+def delete_chessboard(name: str) -> None:
     path = profile_path(name)
     if not path.exists():
-        raise HTTPException(404, "Profile not found")
+        raise HTTPException(404, "Chessboard not found")
     path.unlink()

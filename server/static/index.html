@@ -7,7 +7,7 @@
 </head>
 <body>
     <div class="app">
-        <aside>
+        <aside class="controls">
             <h1>Sintez Camera Calibration</h1>
 
             <!-- Source tabs -->
@@ -16,17 +16,8 @@
                 <button class="tab" data-tab="remote">Remote</button>
             </div>
 
-            <!-- Local camera -->
-            <section id="local-panel">
-                <h2>Camera</h2>
-                <div class="row">
-                    <select id="local-camera"></select>
-                    <button id="refresh-cameras" class="secondary small" title="Refresh camera list">↻</button>
-                </div>
-            </section>
-
-            <!-- Remote agent -->
-            <section id="remote-panel" hidden>
+            <!-- Remote agent card: only visible on the Remote tab. -->
+            <div class="card" id="remote-panel" hidden>
                 <h2>Remote Connection</h2>
 
                 <!-- Saved profiles list (rendered by JS) -->
@@ -59,8 +50,11 @@
                     </div>
                 </div>
 
-                <!-- Single connect / disconnect toggle -->
-                <button id="ssh-toggle-conn" class="full" style="margin-top:8px" disabled>&#x21C4; Connect</button>
+                <!-- Single connect / disconnect toggle (hidden -- the per-row
+                     ⏻ button on each saved connection is the primary action;
+                     this stays in the DOM so the form-driven flow still works
+                     but is not visible to avoid two competing CTAs) -->
+                <button id="ssh-toggle-conn" class="full" style="margin-top:8px;display:none" disabled>&#x21C4; Connect</button>
 
                 <!-- Post-connect panel -->
                 <div id="ssh-connected-panel" hidden>
@@ -102,105 +96,194 @@
                         <pre id="agent-log" class="cmd-block" hidden></pre>
                     </div>
 
-                    <!-- Agent running — camera selection -->
+                    <!-- Agent running — only the agent controls live here now.
+                         Camera type / camera selection moved into the Session
+                         card so it sits next to the Local tab's pickers. -->
                     <div id="agent-running-panel" hidden style="margin-top:8px">
                         <span class="pill ok">Agent: running</span>
-                        <div class="row" style="margin-top:8px;align-items:flex-end;gap:6px">
-                            <div style="flex:1">
-                                <label>Remote Camera</label>
-                                <select id="remote-camera-select"></select>
-                            </div>
-                            <button id="refresh-remote-cameras" class="secondary small" title="Re-scan remote cameras">&#x21BB;</button>
-                        </div>
+
                         <button id="disable-agent-btn" class="danger full" style="margin-top:6px">&#x25A0; Disable Agent</button>
                         <button id="re-enable-agent-btn" class="secondary small" style="margin-top:4px;width:100%">&#x21BA; Restart Agent</button>
                     </div>
                 </div>
-
-                <!-- Manual token fallback -->
-                <details style="margin-top:12px">
-                    <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Manual: run agent yourself</summary>
-                    <button id="issue-token" class="secondary" style="margin-top:6px;width:100%">Issue Token</button>
-                    <input id="remote-token" readonly placeholder="token appears here" style="margin-top:4px" />
-                    <pre id="agent-cmd" class="cmd-block"></pre>
-                </details>
-            </section>
-
-            <!-- Chessboard parameters -->
-            <h2>Chessboard</h2>
-            <label>Inner corners (W × H)</label>
-            <div class="row">
-                <input type="number" id="board-w" value="9" min="2" max="30" />
-                <span class="sep">×</span>
-                <input type="number" id="board-h" value="6" min="2" max="30" />
             </div>
-            <label>Square size (mm)</label>
-            <input type="number" id="square-size" value="25" min="0.1" step="0.1" />
-            <label>Captures required</label>
-            <input type="number" id="required-captures" value="20" min="3" max="200" />
 
-            <details class="advanced">
-                <summary>Advanced options</summary>
-                <div class="flag-group">
-                    <label class="flag-row"><input type="checkbox" class="calib-flag" value="4096" /> Zero tangential distortion</label>
-                    <label class="flag-row"><input type="checkbox" class="calib-flag" value="1024" /> Fix aspect ratio</label>
-                    <label class="flag-row"><input type="checkbox" class="calib-flag" value="16384" /> Rational model</label>
+            <!-- Chessboard selection + management -->
+            <div class="card">
+                <h2>Chessboard</h2>
+
+                <!-- One-line description of the chessboard currently in use -->
+                <div id="chessboard-current" class="chess-current">
+                    <span class="empty">No chessboard selected.</span>
                 </div>
-            </details>
 
-            <!-- Profile -->
-            <h2>Profile</h2>
-            <label>Name</label>
-            <input id="session-name" placeholder="e.g. front_left" />
-            <div class="row" style="margin-top:6px">
-                <select id="profile-select" class="flex2"></select>
-                <button id="save-profile" class="secondary small">Save</button>
-                <button id="delete-profile" class="danger small">Del</button>
+                <!-- Dropdown of saved chessboards -->
+                <select id="chessboard-select" style="margin-top:6px"></select>
+
+                <!-- Buttons: pick, manage overlay -->
+                <div class="row" style="margin-top:6px;gap:6px">
+                    <button id="chessboard-manage" class="secondary small" style="flex:1">Manage …</button>
+                </div>
+                <small style="color:var(--muted);display:block;margin-top:4px">
+                    Add or edit chessboards in the overlay window.
+                </small>
             </div>
 
-            <!-- Capture controls -->
-            <h2>Capture</h2>
-            <button id="start-session" class="full">▶ Start Capture</button>
-            <div class="row" style="margin-top:6px">
-                <button id="capture-now" class="secondary" disabled>Capture Now</button>
-                <button id="abort-session" class="danger" disabled>Abort</button>
+            <!-- Session card: one card holds everything needed to start a
+                 session — camera type, camera(s), name, captures, advanced.
+                 Always visible (regardless of Local/Remote tab) so the
+                 capture controls are never out of reach. -->
+            <div class="card" id="session-card">
+                <h2>Session</h2>
+
+                <!-- Camera type + camera-selection block.  JS swaps the visible
+                     sub-section based on the active tab so both Local and
+                     Remote camera pickers live here (matching layout). -->
+                <div id="camera-section">
+                    <label>Camera type</label>
+                    <select id="camera-mode">
+                        <option value="mono">Mono (single camera)</option>
+                        <option value="stereo_lr">Stereo L | R (one camera, side-by-side)</option>
+                        <option value="stereo_separate">Stereo (two cameras)</option>
+                    </select>
+
+                    <!-- Local camera pickers -->
+                    <div id="local-cameras">
+                        <div id="local-cam-single" style="margin-top:8px">
+                            <div class="row">
+                                <select id="local-camera"></select>
+                                <button id="refresh-cameras" class="secondary small" title="Refresh camera list">↻</button>
+                            </div>
+                        </div>
+                        <div id="local-cam-dual" hidden style="margin-top:8px">
+                            <div class="row" style="margin-bottom:6px">
+                                <span class="cam-side-label">LEFT</span>
+                                <select id="local-camera-left"></select>
+                                <button id="refresh-cameras-2" class="secondary small" title="Refresh camera list">↻</button>
+                            </div>
+                            <div class="row">
+                                <span class="cam-side-label">RIGHT</span>
+                                <select id="local-camera-right"></select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Remote camera pickers -->
+                    <div id="remote-cameras" hidden>
+                        <div id="remote-cam-single" style="margin-top:8px">
+                            <div class="row" style="align-items:flex-end;gap:6px">
+                                <div style="flex:1">
+                                    <label>Remote Camera</label>
+                                    <select id="remote-camera-select"></select>
+                                </div>
+                                <button id="refresh-remote-cameras" class="secondary small" title="Re-scan remote cameras">&#x21BB;</button>
+                            </div>
+                        </div>
+                        <div id="remote-cam-dual" hidden style="margin-top:8px">
+                            <div class="row" style="margin-bottom:6px">
+                                <span class="cam-side-label">LEFT</span>
+                                <select id="remote-camera-left"></select>
+                            </div>
+                            <div class="row">
+                                <span class="cam-side-label">RIGHT</span>
+                                <select id="remote-camera-right"></select>
+                                <button id="refresh-remote-cameras-2" class="secondary small" title="Re-scan remote cameras">&#x21BB;</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <label style="margin-top:10px">Session name (optional)</label>
+                <input id="session-name" placeholder="auto-generated if blank" />
+                <label style="margin-top:6px">Captures required</label>
+                <input type="number" id="required-captures" value="20" min="3" max="200" />
+
+                <details class="advanced">
+                    <summary>Advanced options</summary>
+                    <div class="flag-group">
+                        <label class="flag-row"><input type="checkbox" class="calib-flag" value="4096" /> Zero tangential distortion</label>
+                        <label class="flag-row"><input type="checkbox" class="calib-flag" value="1024" /> Fix aspect ratio</label>
+                        <label class="flag-row"><input type="checkbox" class="calib-flag" value="16384" /> Rational model</label>
+                    </div>
+                </details>
+
+                <button id="start-session" class="full" style="margin-top:8px">▶ Start Capture</button>
+                <div class="row" style="margin-top:6px">
+                    <button id="capture-now" class="secondary" disabled>Capture Now</button>
+                    <button id="abort-session" class="danger" disabled>Abort</button>
+                </div>
+                <button id="finish-session" class="success full" disabled style="margin-top:6px">Finish &amp; Calibrate</button>
             </div>
-            <button id="finish-session" class="success full" disabled style="margin-top:6px">Finish &amp; Calibrate</button>
         </aside>
 
         <main>
-            <div class="video-wrap">
-                <canvas id="preview"></canvas>
+            <!-- LIVE view: shown only while a session is running -->
+            <div id="live-view" hidden>
+                <div class="video-wrap">
+                    <canvas id="preview"></canvas>
+                </div>
+                <!-- Captured frames (annotated) accumulate here as they're taken -->
+                <div class="captured-strip" id="captured-strip">
+                    <div class="captured-strip-title">
+                        <span>Captured frames</span>
+                        <span id="captured-count" class="pill">0</span>
+                    </div>
+                    <div class="captured-thumbs" id="captured-thumbs">
+                        <span class="empty">Captured frames will appear here.</span>
+                    </div>
+                </div>
             </div>
-            <div class="statusbar">
-                <span class="pill" id="state-pill">idle</span>
-                <span class="pill" id="captures-pill">captures: 0 / —</span>
-                <span class="pill" id="board-pill">board: —</span>
-                <span class="pill" id="blur-pill">blur: —</span>
-                <span class="pill" id="conn-pill">disconnected</span>
-            </div>
-            <div class="hint" id="hint">Pick a camera and press Start Capture to begin.</div>
-            <div class="result" id="result" hidden></div>
 
+            <!-- DETAIL / RESULT view: shown for finished or history-selected sessions -->
             <div class="detail-panel" id="detail-panel" hidden>
                 <div class="detail-header">
                     <span id="detail-title">Session Detail</span>
                     <div style="display:flex;gap:5px;align-items:center">
                         <button id="copy-intrinsics" class="secondary small" hidden>Copy YAML</button>
-                        <button class="secondary small" onclick="closeDetail()">✕</button>
+                        <button class="secondary small" onclick="closeDetail()">✕ Close</button>
                     </div>
                 </div>
                 <div id="detail-body"></div>
             </div>
 
+            <!-- PLACEHOLDER: idle, nothing selected -->
+            <div class="middle-placeholder" id="middle-placeholder">
+                <div>Press <b>▶ Start Capture</b> to begin a new calibration,<br/>
+                     or <b>View</b> a session from history to see its result.</div>
+            </div>
+        </main>
+
+        <aside class="rightbar">
+            <!-- Calibration status (top) -->
+            <div class="status-card" id="status-card">
+                <div class="status-head">
+                    <span class="status-title">Calibration status</span>
+                    <span class="pill" id="conn-pill">disconnected</span>
+                </div>
+                <div class="status-head" style="margin-top:8px">
+                    <span class="pill" id="state-pill">idle</span>
+                    <span class="pill" id="bw-pill" hidden title="Remote frame-stream bandwidth">— B/s</span>
+                    <span class="pill" id="captures-pill">captures: 0 / —</span>
+                </div>
+                <div class="status-progress">
+                    <div class="progress"><div class="progress-bar" id="progress-bar"></div></div>
+                </div>
+                <div class="status-metrics">
+                    <span class="pill" id="board-pill">board: —</span>
+                    <span class="pill" id="blur-pill">blur: —</span>
+                </div>
+            </div>
+
+            <div class="hint" id="hint">Pick a camera, select a chessboard, then press Start Capture.</div>
+
             <details class="sessions-panel" id="sessions-panel" open>
                 <summary>
-                    <span>Sessions</span>
+                    <span>Sessions (history)</span>
                     <button id="refresh-sessions" class="secondary small" title="Refresh list" onclick="event.preventDefault(); loadSessionList()">↻</button>
                 </summary>
                 <div id="sessions-list"><span class="session-empty">Loading…</span></div>
             </details>
-        </main>
+        </aside>
     </div>
 
     <!-- Frame lightbox -->
@@ -212,6 +295,76 @@
             <div class="lb-counter" id="lb-counter"></div>
         </div>
         <button class="lb-nav lb-next" onclick="lightboxNav(1)">&#8250;</button>
+    </div>
+
+    <!-- Chessboard overlay (add / edit / delete) -->
+    <div class="overlay-backdrop" id="chessboard-overlay" hidden>
+        <div class="overlay-dialog" role="dialog" aria-labelledby="cb-overlay-title">
+            <div class="overlay-header">
+                <span id="cb-overlay-title">Chessboards</span>
+                <button class="overlay-close" onclick="closeChessboardOverlay()">✕</button>
+            </div>
+
+            <div class="overlay-body">
+                <!-- Existing chessboards list (left column on wide layouts) -->
+                <div class="overlay-list">
+                    <div id="chessboard-list" class="cb-list"></div>
+                    <button id="chessboard-new" class="secondary small full" style="margin-top:8px">+ New chessboard</button>
+                </div>
+
+                <!-- Form for the currently-edited chessboard (right column) -->
+                <div class="overlay-form" id="chessboard-form-panel">
+                    <p class="overlay-form-help" id="chessboard-form-help">
+                        Pick a chessboard from the list, or click <b>+ New chessboard</b>.
+                    </p>
+
+                    <label>Name</label>
+                    <input id="cb-name" placeholder="e.g. front_left_8x5" />
+
+                    <label>Camera mode</label>
+                    <select id="cb-mode">
+                        <option value="mono">Mono (single camera)</option>
+                        <option value="stereo_lr">Stereo L | R (one camera, side-by-side)</option>
+                        <option value="stereo_separate">Stereo (two cameras)</option>
+                    </select>
+
+                    <div class="row" style="margin-top:6px">
+                        <div style="flex:1">
+                            <label>Inner corners W</label>
+                            <input type="number" id="cb-w" value="9" min="2" max="30" />
+                        </div>
+                        <span class="sep" style="margin:18px 6px 0">×</span>
+                        <div style="flex:1">
+                            <label>Inner corners H</label>
+                            <input type="number" id="cb-h" value="6" min="2" max="30" />
+                        </div>
+                    </div>
+
+                    <label>Square size (mm)</label>
+                    <input type="number" id="cb-square" value="25" min="0.1" step="0.1" />
+
+                    <label style="margin-top:6px">Captures required</label>
+                    <input type="number" id="cb-required" value="20" min="3" max="200" />
+
+                    <details class="advanced">
+                        <summary>Advanced (calibration flags)</summary>
+                        <div class="flag-group">
+                            <label class="flag-row"><input type="checkbox" class="cb-flag" value="4096" /> Zero tangential distortion</label>
+                            <label class="flag-row"><input type="checkbox" class="cb-flag" value="1024" /> Fix aspect ratio</label>
+                            <label class="flag-row"><input type="checkbox" class="cb-flag" value="16384" /> Rational model</label>
+                        </div>
+                    </details>
+
+                    <div class="overlay-form-actions">
+                        <button id="chessboard-save" class="full">Save</button>
+                        <div class="row" style="margin-top:6px;gap:6px">
+                            <button id="chessboard-delete" class="danger small" style="flex:1">Delete</button>
+                            <button id="chessboard-cancel" class="secondary small" style="flex:1">Close</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script src="/static/app.js"></script>

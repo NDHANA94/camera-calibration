@@ -85,6 +85,7 @@ class SshEnablePayload(SshCheckPayload):
 class BindPayload(BaseModel):
     session_id: str
     camera_id: str
+    camera_id_2: Optional[str] = None   # for STEREO_SEPARATE sessions
 
 
 class AgentIdPayload(BaseModel):
@@ -247,7 +248,91 @@ async def ssh_enable(payload: SshEnablePayload, request: Request) -> dict:
     # they show up.
     asyncio.create_task(_probe_cameras(agent_id, state))
 
+    # Start the heartbeat: the host periodically health-checks the agent over
+    # the SSH tunnel.  If the heartbeat is lost (network down, agent crashed,
+    # box powered off) the agent is marked DOWN so the UI can react.
+    state.last_heartbeat = asyncio.get_event_loop().time()
+    state.heartbeat_task = asyncio.create_task(_heartbeat_loop(agent_id))
+
     return {"agent_id": agent_id, "server_url": server_base}
+
+
+# How often the host pings the remote agent, and how many consecutive misses
+# before we declare it DOWN.  ~3 x 5 s ≈ 15 s to detect a dead agent.
+HEARTBEAT_INTERVAL_S = 5.0
+HEARTBEAT_MAX_FAILURES = 3
+
+
+async def _ping_agent(state, timeout: float = 5.0) -> bool:
+    """Health-check the agent over the SSH tunnel (GET /healthz).  Returns
+    True iff the agent's HTTP server answered."""
+    try:
+        reader, writer, closer = await asyncio.wait_for(
+            tunnel_to_agent(state.ssh_conn, state.agent_port), timeout=timeout
+        )
+    except Exception:
+        return False
+    try:
+        writer.write(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        buf = b""
+        while len(buf) < 64:
+            chunk = await asyncio.wait_for(reader.read(256), timeout=timeout)
+            if not chunk:
+                break
+            buf += chunk
+        return b"200" in buf.split(b"\r\n", 1)[0] or b"ok" in buf
+    except Exception:
+        return False
+    finally:
+        try: writer.close()
+        except Exception: pass
+        try: await closer()
+        except Exception: pass
+
+
+async def _heartbeat_loop(agent_id: str) -> None:
+    fails = 0
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+        state = agent_registry.get(agent_id)
+        if state is None:
+            return  # agent already gone (disabled / re-enabled)
+        if await _ping_agent(state):
+            fails = 0
+            state.last_heartbeat = asyncio.get_event_loop().time()
+        else:
+            fails += 1
+            log.info("agent %s heartbeat miss %d/%d", agent_id, fails, HEARTBEAT_MAX_FAILURES)
+            if fails >= HEARTBEAT_MAX_FAILURES:
+                log.warning("agent %s heartbeat lost -- marking down", agent_id)
+                agent_registry.mark_down(
+                    agent_id, "Lost connection to the remote agent (no heartbeat)."
+                )
+                return
+
+
+@router.get("/agent/{agent_id}/status")
+async def agent_status(agent_id: str) -> dict:
+    """Liveness of a remote agent, for the UI's heartbeat poll.  Reports
+    ``down`` (with a reason) when the agent died unexpectedly so the UI can
+    flip it back to 'not running'."""
+    state = agent_registry.get(agent_id)
+    if state is not None:
+        now = asyncio.get_event_loop().time()
+        return {
+            "alive": True, "down": False, "reason": None,
+            "connected": state.cameras_ready.is_set(),
+            "cameras": len(state.cameras),
+            "heartbeat_age": (now - state.last_heartbeat) if state.last_heartbeat else None,
+        }
+    down = agent_registry.down_info(agent_id)
+    if down is not None:
+        return {"alive": False, "down": True, "reason": down["reason"], "connected": False}
+    if agent_registry.is_issued(agent_id):
+        return {"alive": False, "down": False, "reason": None,
+                "connected": False, "pending": True}
+    return {"alive": False, "down": True, "reason": "Agent not found.", "connected": False}
 
 
 async def _probe_cameras(agent_id: str, state) -> bool:
@@ -319,10 +404,17 @@ async def ssh_disable(payload: AgentIdPayload) -> dict:
 @router.post("/agent/{agent_id}/bind")
 async def bind_agent(agent_id: str, payload: BindPayload) -> dict:
     try:
-        agent_registry.bind_session(agent_id, payload.session_id, payload.camera_id)
+        agent_registry.bind_session(
+            agent_id, payload.session_id, payload.camera_id, payload.camera_id_2,
+        )
     except KeyError:
         raise HTTPException(404, "Agent not found or already disconnected")
-    return {"ok": True, "session_id": payload.session_id, "camera_id": payload.camera_id}
+    return {
+        "ok": True,
+        "session_id": payload.session_id,
+        "camera_id": payload.camera_id,
+        "camera_id_2": payload.camera_id_2,
+    }
 
 
 @router.get("/agent/{agent_id}/log")
@@ -353,6 +445,20 @@ async def tail_agent_log(agent_id: str) -> StreamingResponse:
 # the browser via Server-Sent Events.
 # ---------------------------------------------------------------------------
 
+def _decode_and_process(runtime, jpeg_bytes: bytes):
+    """Decode a JPEG and run it through the session pipeline.  Sync + CPU-heavy
+    (board detection), so callers run it in a thread executor to keep the event
+    loop free for reading the next frame.  Returns (annotated_jpeg, events)."""
+    import cv2
+    import numpy as np
+    from ..core.stream_processing import process_frame
+    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return None, []
+    return process_frame(runtime, frame)
+
+
 @router.get("/stream/{session_id}")
 async def remote_stream(session_id: str) -> StreamingResponse:
     """SSE proxy of the remote agent's binary JPEG stream.
@@ -360,15 +466,29 @@ async def remote_stream(session_id: str) -> StreamingResponse:
     The browser opens ``EventSource('/remote/stream/<sid>')`` and gets
     base64-encoded JPEG frames as ``data: {"frame": "<b64>"}\\n\\n``
     messages, plus a ``data: {"type": "status", ...}`` marker at start.
+
+    For STEREO_SEPARATE sessions the agent's ``/ws/stream_stereo`` endpoint
+    is used instead, which expects ``camera_left`` and ``camera_right``
+    query params.  The server-side pipeline handles the paired frames.
     """
     state = agent_registry.get_by_session(session_id)
     if state is None or not state.start_camera_id:
         raise HTTPException(404, "No remote stream for this session")
     camera_id = state.start_camera_id
+    camera_id_2 = state.start_camera_id_2
     ssh_conn = state.ssh_conn
     agent_port = state.agent_port
 
     async def sse():
+        from ..core.runtime import get_runtime
+
+        # Per-session pipeline (mono or stereo per the session profile).  This
+        # is what turns the remote frames into detected corners + saved
+        # captures -- without it the remote stream is just a video relay and
+        # no calibration data is ever collected.
+        runtime = await get_runtime(session_id)
+        loop = asyncio.get_event_loop()
+
         # Open a fresh channel to the agent for this stream
         try:
             reader, writer, closer = await tunnel_to_agent(ssh_conn, agent_port)
@@ -378,10 +498,19 @@ async def remote_stream(session_id: str) -> StreamingResponse:
         try:
             # Send HTTP/1.1 upgrade to the agent's /ws/stream.  The agent
             # implements a minimal WebSocket server (RFC 6455) so we
-            # speak that protocol over the channel.
+            # speak that protocol over the channel.  For STEREO_SEPARATE
+            # sessions use /ws/stream_stereo and pass both cameras.
             key = base64.b64encode(hashlib.md5(str(id(reader)).encode()).digest()).decode()
+            from urllib.parse import quote
+            if camera_id_2:
+                url = (
+                    f"/ws/stream_stereo?camera_left={quote(camera_id, safe='')}"
+                    f"&camera_right={quote(camera_id_2, safe='')}&fps=15&quality=80"
+                )
+            else:
+                url = f"/ws/stream?camera={quote(camera_id, safe='')}&fps=15&quality=80"
             req = (
-                f"GET /ws/stream?camera={camera_id}&fps=15&quality=80 HTTP/1.1\r\n"
+                f"GET {url} HTTP/1.1\r\n"
                 f"Host: x\r\n"
                 f"Upgrade: websocket\r\n"
                 f"Connection: Upgrade\r\n"
@@ -404,62 +533,97 @@ async def remote_stream(session_id: str) -> StreamingResponse:
                 yield f"data: {json.dumps({'type': 'error', 'message': 'upgrade failed: ' + status_line.decode(errors='replace') + ' ' + body[:200].decode(errors='replace')})}\n\n"
                 return
 
-            # Stream WebSocket frames: first text frame = status, then
-            # binary frames = JPEGs.  We parse client-side and re-emit
-            # each JPEG as a base64 SSE message.
             yield f"data: {json.dumps({'type': 'started', 'camera': camera_id})}\n\n"
-            buf = head.split(b"\r\n\r\n", 1)[1]
-            while True:
-                while len(buf) < 2:
-                    chunk = await reader.read(4096)
-                    if not chunk:
-                        return
-                    buf += chunk
-                b1, b2 = buf[0], buf[1]
-                opcode = b1 & 0x0F
-                n = b2 & 0x7F
-                idx = 2
-                if n == 126:
-                    while len(buf) < idx + 2:
-                        buf += await reader.read(4096)
-                    n = struct.unpack(">H", buf[idx:idx+2])[0]
-                    idx += 2
-                elif n == 127:
-                    while len(buf) < idx + 8:
-                        buf += await reader.read(4096)
-                    n = struct.unpack(">Q", buf[idx:idx+8])[0]
-                    idx += 8
-                # No client->server masking since we sent unmasked, but be safe
-                masked = b2 & 0x80
-                if masked:
-                    while len(buf) < idx + 4:
-                        buf += await reader.read(4096)
-                    mask = buf[idx:idx+4]
-                    idx += 4
-                else:
-                    mask = b""
-                while len(buf) < idx + n:
-                    chunk = await reader.read(4096)
-                    if not chunk:
-                        return
-                    buf += chunk
-                payload = bytes(buf[idx:idx+n])
-                if mask:
-                    payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-                buf = buf[idx+n:]
 
-                if opcode == 0x8:  # close
-                    return
-                if opcode == 0x9:  # ping
-                    continue
-                if opcode == 0x1:  # text
-                    try:
-                        msg = json.loads(payload)
-                        yield f"data: {json.dumps({'type': 'status', **msg})}\n\n"
-                    except Exception:
-                        pass
-                elif opcode == 0x2:  # binary
-                    yield f"data: {json.dumps({'type': 'frame', 'data': base64.b64encode(payload).decode()})}\n\n"
+            # Decouple reading from processing.  A pump task parses WS frames as
+            # fast as they arrive and keeps only the NEWEST JPEG (older frames
+            # are dropped); the main loop processes that newest frame off the
+            # event loop.  This way slow board detection can never make the
+            # preview lag behind real time -- we just skip the backlog.
+            box = {"jpeg": None, "texts": [], "done": False}
+            new_data = asyncio.Event()
+
+            async def pump(buf: bytes):
+                try:
+                    while True:
+                        while len(buf) < 2:
+                            c = await reader.read(4096)
+                            if not c:
+                                return
+                            buf += c
+                        b1, b2 = buf[0], buf[1]
+                        opcode = b1 & 0x0F
+                        n = b2 & 0x7F
+                        idx = 2
+                        if n == 126:
+                            while len(buf) < idx + 2:
+                                buf += await reader.read(4096)
+                            n = struct.unpack(">H", buf[idx:idx + 2])[0]
+                            idx += 2
+                        elif n == 127:
+                            while len(buf) < idx + 8:
+                                buf += await reader.read(4096)
+                            n = struct.unpack(">Q", buf[idx:idx + 8])[0]
+                            idx += 8
+                        masked = b2 & 0x80
+                        if masked:
+                            while len(buf) < idx + 4:
+                                buf += await reader.read(4096)
+                            mask = buf[idx:idx + 4]
+                            idx += 4
+                        else:
+                            mask = b""
+                        while len(buf) < idx + n:
+                            c = await reader.read(4096)
+                            if not c:
+                                return
+                            buf += c
+                        payload = bytes(buf[idx:idx + n])
+                        if mask:
+                            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+                        buf = buf[idx + n:]
+
+                        if opcode == 0x8:  # close
+                            return
+                        if opcode == 0x9:  # ping
+                            continue
+                        if opcode == 0x1:  # text (agent "started" marker)
+                            box["texts"].append(payload)
+                            new_data.set()
+                        elif opcode == 0x2:  # binary JPEG -- keep only the newest
+                            box["jpeg"] = payload
+                            new_data.set()
+                finally:
+                    box["done"] = True
+                    new_data.set()
+
+            pump_task = asyncio.create_task(pump(head.split(b"\r\n\r\n", 1)[1]))
+            try:
+                while True:
+                    await new_data.wait()
+                    new_data.clear()
+                    while box["texts"]:
+                        t = box["texts"].pop(0)
+                        try:
+                            yield f"data: {json.dumps(json.loads(t))}\n\n"
+                        except Exception:
+                            pass
+                    jpeg_in = box["jpeg"]
+                    box["jpeg"] = None
+                    if jpeg_in is not None:
+                        out_jpeg, events = await loop.run_in_executor(
+                            None, _decode_and_process, runtime, jpeg_in
+                        )
+                        if out_jpeg is not None:
+                            yield (f"data: {json.dumps({'type': 'frame', 'data': base64.b64encode(out_jpeg).decode()})}\n\n")
+                            for ev in events:
+                                yield f"data: {json.dumps(ev)}\n\n"
+                        if getattr(runtime, "aborted", False):
+                            return
+                    if box["done"] and box["jpeg"] is None:
+                        return
+            finally:
+                pump_task.cancel()
         except asyncio.CancelledError:
             raise
         except Exception as exc:

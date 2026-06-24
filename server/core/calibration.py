@@ -126,6 +126,115 @@ def calibrate(
     return meta
 
 
+def calibrate_stereo(
+    profile: Profile,
+    image_size: Tuple[int, int],
+    left_captures: Sequence[np.ndarray],
+    right_captures: Sequence[np.ndarray],
+    out_dir: Path,
+) -> dict:
+    """Stereo calibration from paired left/right corner sets.
+
+    Calibrates each camera individually, then runs ``cv2.stereoCalibrate``
+    with fixed intrinsics to recover the relative pose (R, T) plus the
+    essential/fundamental matrices.  ``image_size`` is the PER-EYE size.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    objp = _object_points(profile.inner_corners_x, profile.inner_corners_y, profile.square_size_mm)
+
+    obj_points: List[np.ndarray] = []
+    pts_l: List[np.ndarray] = []
+    pts_r: List[np.ndarray] = []
+    for cl, cr in zip(left_captures, right_captures):
+        if cl is None or cr is None:
+            continue
+        obj_points.append(objp)
+        pts_l.append(cl.reshape(-1, 1, 2).astype(np.float32))
+        pts_r.append(cr.reshape(-1, 1, 2).astype(np.float32))
+
+    if len(obj_points) < 3:
+        raise ValueError(
+            f"Need at least 3 valid stereo pairs for calibration; got {len(obj_points)}"
+        )
+
+    flags = int(profile.flags)
+    rms_l, K1, d1, _, _ = cv2.calibrateCamera(obj_points, pts_l, image_size, None, None, flags=flags)
+    rms_r, K2, d2, _, _ = cv2.calibrateCamera(obj_points, pts_r, image_size, None, None, flags=flags)
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5)
+    rms, K1, d1, K2, d2, R, T, E, F = cv2.stereoCalibrate(
+        obj_points, pts_l, pts_r,
+        K1, d1, K2, d2, image_size,
+        criteria=criteria, flags=cv2.CALIB_FIX_INTRINSIC,
+    )
+
+    # Rectification (handy for downstream consumers / sanity).
+    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
+        K1, d1, K2, d2, image_size, R, T, flags=cv2.CALIB_ZERO_DISPARITY, alpha=0,
+    )
+
+    baseline_mm = float(np.linalg.norm(T))
+    npz_path = out_dir / "result.npz"
+    yaml_path = out_dir / "result.yaml"
+    meta_path = out_dir / "meta.json"
+
+    np.savez(
+        npz_path,
+        stereo=np.array(True),
+        K1=K1, D1=d1, K2=K2, D2=d2,
+        R=R, T=T, E=E, F=F, R1=R1, R2=R2, P1=P1, P2=P2, Q=Q,
+        image_size=np.array(image_size),
+        rms=np.array(rms),
+        rms_left=np.array(rms_l), rms_right=np.array(rms_r),
+        reprojection_error=np.array(rms),
+        baseline_mm=np.array(baseline_mm),
+        profile_inner_corners_x=np.array(profile.inner_corners_x),
+        profile_inner_corners_y=np.array(profile.inner_corners_y),
+        profile_square_size_mm=np.array(profile.square_size_mm),
+    )
+
+    fs = cv2.FileStorage(str(yaml_path), cv2.FILE_STORAGE_WRITE)
+    fs.write("stereo", 1)
+    fs.write("image_width", image_size[0])
+    fs.write("image_height", image_size[1])
+    fs.write("K1", K1); fs.write("D1", d1)
+    fs.write("K2", K2); fs.write("D2", d2)
+    fs.write("R", R); fs.write("T", T)
+    fs.write("E", E); fs.write("F", F)
+    fs.write("R1", R1); fs.write("R2", R2); fs.write("P1", P1); fs.write("P2", P2); fs.write("Q", Q)
+    fs.write("rms", float(rms))
+    fs.write("baseline_mm", baseline_mm)
+    fs.write("square_size_mm", float(profile.square_size_mm))
+    fs.write("board_width", int(profile.inner_corners_x))
+    fs.write("board_height", int(profile.inner_corners_y))
+    fs.release()
+
+    meta = {
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "stereo": True,
+        "image_size": list(image_size),
+        "rms": float(rms),
+        "rms_left": float(rms_l),
+        "rms_right": float(rms_r),
+        "reprojection_error": float(rms),
+        "baseline_mm": baseline_mm,
+        "n_captures": len(obj_points),
+        "profile": {
+            "inner_corners_x": profile.inner_corners_x,
+            "inner_corners_y": profile.inner_corners_y,
+            "square_size_mm": profile.square_size_mm,
+            "flags": int(profile.flags),
+        },
+        "files": {"npz": str(npz_path), "yaml": str(yaml_path), "meta": str(meta_path)},
+    }
+    meta_path.write_text(json.dumps(meta, indent=2))
+    log.info(
+        "Stereo calibration done: rms=%.4f baseline=%.1fmm pairs=%d",
+        rms, baseline_mm, len(obj_points),
+    )
+    return meta
+
+
 def _reprojection_error(obj_points, img_points, rvecs, tvecs, K, dist) -> float:
     total = 0.0
     n = 0
