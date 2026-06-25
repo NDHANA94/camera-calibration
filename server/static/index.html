@@ -20,35 +20,20 @@
             <div class="card" id="remote-panel" hidden>
                 <h2>Remote Connection</h2>
 
-                <!-- Saved profiles list (rendered by JS) -->
+                <!-- Saved profiles list (rendered by JS).  The card stays small;
+                     all Add / Edit lives in the SSH overlay dialog opened
+                     by the Manage button below. -->
                 <div id="ssh-profiles-list"></div>
-                <button id="ssh-add-connection" class="secondary small" style="margin-top:4px;width:100%">+ New Connection</button>
+                <button id="ssh-manage" class="secondary small" style="margin-top:6px;width:100%">Manage …</button>
 
-                <!-- Profile form (hidden until Add/Edit) -->
-                <div id="ssh-form-panel" hidden style="margin-top:8px;padding:8px;border:1px solid var(--border);border-radius:4px">
-                    <input id="ssh-profile-name" placeholder="Name (e.g. Orin NX)" style="margin-bottom:4px" />
-                    <label>Host / IP</label>
-                    <input id="ssh-host" placeholder="192.168.1.100" />
-                    <div class="row" style="margin-top:4px">
-                        <div style="flex:1">
-                            <label>Port</label>
-                            <input id="ssh-port" type="number" value="22" min="1" max="65535" />
-                        </div>
-                        <div style="flex:2;margin-left:6px">
-                            <label>Username</label>
-                            <input id="ssh-user" placeholder="ubuntu" />
-                        </div>
-                    </div>
-                    <label>Password</label>
-                    <input id="ssh-pass" type="password" placeholder="••••••••" />
-                    <label style="margin-top:4px">Agent Port</label>
-                    <input id="agent-port" type="number" value="8765" min="1" max="65535" />
-                    <small style="color:var(--muted, #888)">Port the agent binds on the remote (loopback). Change if 8765 is taken (e.g. 8766).</small>
-                    <div class="row" style="margin-top:6px;gap:6px">
-                        <button id="ssh-save-profile" class="secondary" style="flex:1">Save</button>
-                        <button id="ssh-cancel-form" class="secondary" style="flex:1">Cancel</button>
-                    </div>
-                </div>
+                <!-- Hidden legacy fields (kept so _sshCreds() can read the
+                     currently-selected profile without restructuring all
+                     callers).  Updated by _fillForm() after each overlay save. -->
+                <input id="ssh-host" type="hidden" />
+                <input id="ssh-port" type="hidden" />
+                <input id="ssh-user" type="hidden" />
+                <input id="ssh-pass" type="hidden" />
+                <input id="agent-port" type="hidden" />
 
                 <!-- Single connect / disconnect toggle (hidden -- the per-row
                      ⏻ button on each saved connection is the primary action;
@@ -66,7 +51,6 @@
                     <div id="agent-not-installed-panel" hidden style="margin-top:8px">
                         <span class="pill bad">Agent: not installed</span>
                         <button id="install-agent-btn" class="full" style="margin-top:6px">&#x2B07; Install Agent</button>
-                        <pre id="install-log" class="cmd-block" hidden></pre>
                     </div>
 
                     <!-- Agent installed but not running -->
@@ -87,13 +71,11 @@
                             <button id="reinstall-agent-btn" class="secondary small" style="flex:1">&#x21BB; Reinstall / Update</button>
                             <button id="remove-agent-btn" class="danger small" style="flex:1">&#x1F5D1; Remove</button>
                         </div>
-                        <pre id="manage-log" class="cmd-block" hidden></pre>
                     </div>
 
                     <!-- Agent enabling (waiting for WS + camera list) -->
                     <div id="agent-enabling-panel" hidden style="margin-top:8px">
                         <span class="pill warn">Enabling agent …</span>
-                        <pre id="agent-log" class="cmd-block" hidden></pre>
                     </div>
 
                     <!-- Agent running — only the agent controls live here now.
@@ -201,9 +183,21 @@
                 <details class="advanced">
                     <summary>Advanced options</summary>
                     <div class="flag-group">
-                        <label class="flag-row"><input type="checkbox" class="calib-flag" value="4096" /> Zero tangential distortion</label>
-                        <label class="flag-row"><input type="checkbox" class="calib-flag" value="1024" /> Fix aspect ratio</label>
-                        <label class="flag-row"><input type="checkbox" class="calib-flag" value="16384" /> Rational model</label>
+                        <label class="flag-row">
+                            <input type="checkbox" class="calib-flag" value="4096" />
+                            <span class="flag-row-label">Zero tangential distortion</span>
+                            <span class="flag-info" data-flag-desc="zero_tangential" title="Show description">ⓘ</span>
+                        </label>
+                        <label class="flag-row">
+                            <input type="checkbox" class="calib-flag" value="1024" />
+                            <span class="flag-row-label">Fix aspect ratio</span>
+                            <span class="flag-info" data-flag-desc="fix_aspect" title="Show description">ⓘ</span>
+                        </label>
+                        <label class="flag-row">
+                            <input type="checkbox" class="calib-flag" value="16384" />
+                            <span class="flag-row-label">Rational model</span>
+                            <span class="flag-info" data-flag-desc="rational" title="Show description">ⓘ</span>
+                        </label>
                     </div>
                 </details>
 
@@ -276,13 +270,33 @@
 
             <div class="hint" id="hint">Pick a camera, select a chessboard, then press Start Capture.</div>
 
-            <details class="sessions-panel" id="sessions-panel" open>
-                <summary>
-                    <span>Sessions (history)</span>
-                    <button id="refresh-sessions" class="secondary small" title="Refresh list" onclick="event.preventDefault(); loadSessionList()">↻</button>
-                </summary>
-                <div id="sessions-list"><span class="session-empty">Loading…</span></div>
-            </details>
+            <!-- History card: list of past sessions.  Wrapped in a .card so
+                 it matches the other right-panel cards.  Body is
+                 scrollable and capped at a viewport-relative height. -->
+            <div class="card sessions-card" id="sessions-panel">
+                <div class="sessions-card-head">
+                    <span class="sessions-card-title">Sessions (history)</span>
+                    <button id="refresh-sessions" class="secondary small" title="Refresh list">↻</button>
+                </div>
+                <div id="sessions-list" class="sessions-list-body"><span class="session-empty">Loading…</span></div>
+            </div>
+
+            <!-- Logs card: bottom of the right panel.  Always visible (not
+                 collapsible) so log output is never hidden.  Body has a
+                 fixed (smaller than history) viewport-relative height. -->
+            <div class="card log-panel" id="log-panel">
+                <div class="log-panel-head">
+                    <span class="log-panel-title">Logs</span>
+                    <span class="log-source-tabs">
+                        <button class="log-source-tab active" data-log-source="all">All</button>
+                        <button class="log-source-tab" data-log-source="install">Install</button>
+                        <button class="log-source-tab" data-log-source="manage">Manage</button>
+                        <button class="log-source-tab" data-log-source="agent">Agent</button>
+                    </span>
+                    <button id="log-clear" class="secondary small" title="Clear log">⌫</button>
+                </div>
+                <pre id="log-card-body" class="cmd-block log-body" aria-live="polite"></pre>
+            </div>
         </aside>
     </div>
 
@@ -318,16 +332,6 @@
                         Pick a chessboard from the list, or click <b>+ New chessboard</b>.
                     </p>
 
-                    <label>Name</label>
-                    <input id="cb-name" placeholder="e.g. front_left_8x5" />
-
-                    <label>Camera mode</label>
-                    <select id="cb-mode">
-                        <option value="mono">Mono (single camera)</option>
-                        <option value="stereo_lr">Stereo L | R (one camera, side-by-side)</option>
-                        <option value="stereo_separate">Stereo (two cameras)</option>
-                    </select>
-
                     <div class="row" style="margin-top:6px">
                         <div style="flex:1">
                             <label>Inner corners W</label>
@@ -343,18 +347,6 @@
                     <label>Square size (mm)</label>
                     <input type="number" id="cb-square" value="25" min="0.1" step="0.1" />
 
-                    <label style="margin-top:6px">Captures required</label>
-                    <input type="number" id="cb-required" value="20" min="3" max="200" />
-
-                    <details class="advanced">
-                        <summary>Advanced (calibration flags)</summary>
-                        <div class="flag-group">
-                            <label class="flag-row"><input type="checkbox" class="cb-flag" value="4096" /> Zero tangential distortion</label>
-                            <label class="flag-row"><input type="checkbox" class="cb-flag" value="1024" /> Fix aspect ratio</label>
-                            <label class="flag-row"><input type="checkbox" class="cb-flag" value="16384" /> Rational model</label>
-                        </div>
-                    </details>
-
                     <div class="overlay-form-actions">
                         <button id="chessboard-save" class="full">Save</button>
                         <div class="row" style="margin-top:6px;gap:6px">
@@ -363,6 +355,87 @@
                         </div>
                     </div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- SSH connection overlay (add / edit / delete saved connections) -->
+    <div class="overlay-backdrop" id="ssh-overlay" hidden>
+        <div class="overlay-dialog" role="dialog" aria-labelledby="ssh-overlay-title">
+            <div class="overlay-header">
+                <span id="ssh-overlay-title">SSH Connections</span>
+                <button class="overlay-close" onclick="closeSshOverlay()">✕</button>
+            </div>
+
+            <div class="overlay-body">
+                <!-- Saved connections list (left column) -->
+                <div class="overlay-list">
+                    <div id="ssh-overlay-list" class="cb-list"></div>
+                    <button id="ssh-overlay-new" class="secondary small full" style="margin-top:8px">+ New connection</button>
+                </div>
+
+                <!-- Form for the currently-edited connection (right column) -->
+                <div class="overlay-form" id="ssh-overlay-form-panel">
+                    <p class="overlay-form-help" id="ssh-overlay-form-help">
+                        Pick a connection from the list, or click <b>+ New connection</b>.
+                    </p>
+
+                    <label>Name</label>
+                    <input id="ssh-ov-name" placeholder="e.g. Orin NX" />
+
+                    <div class="row" style="margin-top:6px">
+                        <div style="flex:2">
+                            <label>Host / IP</label>
+                            <input id="ssh-ov-host" placeholder="192.168.1.100" />
+                        </div>
+                        <div style="flex:1;margin-left:6px">
+                            <label>Port</label>
+                            <input id="ssh-ov-port" type="number" value="22" min="1" max="65535" />
+                        </div>
+                    </div>
+
+                    <div class="row" style="margin-top:6px">
+                        <div style="flex:1">
+                            <label>Username</label>
+                            <input id="ssh-ov-user" placeholder="ubuntu" />
+                        </div>
+                        <div style="flex:1;margin-left:6px">
+                            <label>Agent port</label>
+                            <input id="ssh-ov-agent-port" type="number" value="8765" min="1" max="65535" />
+                        </div>
+                    </div>
+
+                    <label style="margin-top:6px">Password</label>
+                    <input id="ssh-ov-pass" type="password" placeholder="••••••••" />
+                    <small style="color:var(--muted, #888);display:block;margin-top:4px">
+                        Saved as plain text on this machine so the server can
+                        run unattended reconnects.  Leave blank to keep the
+                        existing password when editing.
+                    </small>
+
+                    <div class="overlay-form-actions">
+                        <button id="ssh-overlay-save" class="full">Save</button>
+                        <div class="row" style="margin-top:6px;gap:6px">
+                            <button id="ssh-overlay-delete" class="danger small" style="flex:1">Delete</button>
+                            <button id="ssh-overlay-cancel" class="secondary small" style="flex:1">Close</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Flag info overlay: shown when user clicks the ⓘ icon next to an
+         advanced option in the Session card. -->
+    <div class="overlay-backdrop" id="flag-info-overlay" hidden>
+        <div class="overlay-dialog overlay-dialog-narrow" data-overlay-close>
+            <div class="overlay-header">
+                <span id="flag-info-title">Advanced option</span>
+                <button class="overlay-close" type="button"
+                        aria-label="Close" data-overlay-close>✕</button>
+            </div>
+            <div class="overlay-body overlay-body-single">
+                <p id="flag-info-body" class="flag-info-body-text"></p>
             </div>
         </div>
     </div>

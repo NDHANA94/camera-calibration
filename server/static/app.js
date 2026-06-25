@@ -38,14 +38,29 @@ const ui = {
     remoteCamDual: $("remote-cam-dual"),
     refreshRemoteCameras: $("refresh-remote-cameras"),
     refreshRemoteCameras2: $("refresh-remote-cameras-2"),
-    // SSH profiles list + form
+    // SSH profiles list + overlay (the inline form has been moved into
+    // an overlay dialog).  The legacy creds fields (`ssh-host`, etc.)
+    // remain so the connect flow can read them after the overlay
+    // synchronises the values in on save.
     sshProfilesList: $("ssh-profiles-list"),
-    sshAddConnection: $("ssh-add-connection"),
-    sshFormPanel: $("ssh-form-panel"),
-    sshProfileName: $("ssh-profile-name"),
-    sshSaveProfile: $("ssh-save-profile"),
-    sshCancelForm: $("ssh-cancel-form"),
-    // SSH credentials (inside form)
+    sshManage: $("ssh-manage"),
+    // Overlay
+    sshOverlay: $("ssh-overlay"),
+    sshOverlayList: $("ssh-overlay-list"),
+    sshOverlayNew: $("ssh-overlay-new"),
+    sshOverlayFormPanel: $("ssh-overlay-form-panel"),
+    sshOverlayFormHelp: $("ssh-overlay-form-help"),
+    sshOvName: $("ssh-ov-name"),
+    sshOvHost: $("ssh-ov-host"),
+    sshOvPort: $("ssh-ov-port"),
+    sshOvUser: $("ssh-ov-user"),
+    sshOvPass: $("ssh-ov-pass"),
+    sshOvAgentPort: $("ssh-ov-agent-port"),
+    sshOverlaySave: $("ssh-overlay-save"),
+    sshOverlayDelete: $("ssh-overlay-delete"),
+    sshOverlayCancel: $("ssh-overlay-cancel"),
+    // SSH credentials (legacy fields, kept in sync with the overlay so the
+    // connect flow still works without DOM restructuring).
     sshHost: $("ssh-host"),
     sshPort: $("ssh-port"),
     sshUser: $("ssh-user"),
@@ -62,15 +77,12 @@ const ui = {
     agentEnablingPanel: $("agent-enabling-panel"),
     agentRunningPanel: $("agent-running-panel"),
     installAgentBtn: $("install-agent-btn"),
-    installLog: $("install-log"),
     agentInstalledPill: $("agent-installed-pill"),
     agentVersionPill: $("agent-version-pill"),
     agentUpdateBanner: $("agent-update-banner"),
     agentLatestVersion: $("agent-latest-version"),
     reinstallAgentBtn: $("reinstall-agent-btn"),
     removeAgentBtn: $("remove-agent-btn"),
-    manageLog: $("manage-log"),
-    agentLog: $("agent-log"),
     enableAgentBtn: $("enable-agent-btn"),
     reEnableAgentBtn: $("re-enable-agent-btn"),
     disableAgentBtn: $("disable-agent-btn"),
@@ -106,15 +118,15 @@ const ui = {
     cbNew: $("chessboard-new"),
     cbFormPanel: $("chessboard-form-panel"),
     cbFormHelp: $("chessboard-form-help"),
-    cbName: $("cb-name"),
-    cbMode: $("cb-mode"),
     cbW: $("cb-w"),
     cbH: $("cb-h"),
     cbSquare: $("cb-square"),
-    cbRequired: $("cb-required"),
     cbSave: $("chessboard-save"),
     cbDelete: $("chessboard-delete"),
     cbCancel: $("chessboard-cancel"),
+    // Log card in the right panel
+    logCardBody: $("log-card-body"),
+    logClear: $("log-clear"),
 };
 
 const state = {
@@ -128,6 +140,9 @@ const state = {
     // Name of the SSH profile currently connected (for highlighting the
     // matching row in the connection list). Empty when not connected.
     activeSshProfile: null,
+    // Local cache of saved SSH profiles; refreshed when the SSH overlay opens
+    // or when an entry is added / deleted.
+    sshProfilesCache: [],
     // Bandwidth tracking for the remote frame stream.  ``bytes`` accumulates
     // over the last ``bandwidth.windowMs``; the read-side updates every
     // ``bandwidth.updateMs`` to keep the indicator cheap.
@@ -171,6 +186,71 @@ function setMiddleView(which) {
 }
 
 // ---------- Status card ----------
+
+// Log card: shared sink for every backend log stream (install / manage /
+// agent).  Each line is prefixed with its source so the tab filter can show
+// or hide it.  Sources are tiny strings: "install", "manage", "agent".
+//
+// We keep ALL lines in an internal buffer (_logAllLines) so that switching
+// tabs in and out doesn't lose any history.  The <pre> only renders the
+// lines that match the current source filter.
+const _logAllLines = [];   // [{stamp, source, line}, ...]  — full history
+let _logActiveSource = "all";
+const _LOG_MAX = 500;      // bound the buffer so it doesn't grow forever
+
+function _log(source, line) {
+    if (!ui.logCardBody) return;
+    const stamp = new Date().toLocaleTimeString([], { hour12: false });
+    _logAllLines.push({ stamp, source, line });
+    if (_logAllLines.length > _LOG_MAX) _logAllLines.splice(0, _logAllLines.length - _LOG_MAX);
+    _renderLogBuffer();
+    // The logs card is always visible; no need to auto-open.
+}
+
+function _renderLogBuffer() {
+    if (!ui.logCardBody) return;
+    const out = [];
+    let hidden = 0;
+    const visibleSource = _logActiveSource;
+    for (const e of _logAllLines) {
+        if (visibleSource === "all" || e.source === visibleSource) {
+            out.push(`[${e.stamp}] [${e.source}] ${e.line}`);
+        } else {
+            hidden++;
+        }
+    }
+    if (hidden > 0) out.push(`… ${hidden} line(s) hidden by source filter …`);
+    ui.logCardBody.textContent = out.join("\n") + "\n";
+    ui.logCardBody.scrollTop = ui.logCardBody.scrollHeight;
+}
+
+function clearLogs() {
+    _logAllLines.length = 0;
+    if (ui.logCardBody) ui.logCardBody.textContent = "";
+}
+window.clearLogs = clearLogs;
+
+function _setActiveLogSource(source) {
+    _logActiveSource = source;
+    document.querySelectorAll(".log-source-tab").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.logSource === source);
+    });
+    _renderLogBuffer();
+}
+
+function _initLogCard() {
+    document.querySelectorAll(".log-source-tab").forEach((btn) => {
+        btn.addEventListener("click", () => {
+            _setActiveLogSource(btn.dataset.logSource);
+        });
+    });
+    if (ui.logClear) {
+        ui.logClear.addEventListener("click", () => clearLogs());
+    }
+    // Refresh button on the Sessions card (was inline-onclick before).
+    const refreshBtn = document.getElementById("refresh-sessions");
+    if (refreshBtn) refreshBtn.addEventListener("click", () => loadSessionList());
+}
 
 function setState(s) {
     ui.statePill.textContent = s;
@@ -438,31 +518,35 @@ function _renderOverlayList() {
     });
 }
 
+// Default values used to fill in fields that aren't part of the overlay
+// form (mode, flags, required_captures, name) so the saved Chessboard
+// stays consistent with the existing schema.
+const _CB_DEFAULTS = {
+    mode: "mono",
+    flags: 0,
+    required_captures: 20,
+};
+
+function _cbDerivedName(w, h, sq) {
+    // Auto-derive a stable, readable name from the physical params.
+    return `${w}x${h}_${String(sq).replace(/\./g, "_")}mm`;
+}
+
 function _loadCbIntoForm(name) {
     const cb = state.chessboards.find((c) => c.name === name);
     if (!cb) return;
     state._editingChessboard = cb;
     state._overlayOriginalName = cb.name;
-    ui.cbName.value = cb.name;
-    ui.cbMode.value = cb.mode || "mono";
     ui.cbW.value = cb.inner_corners_x;
     ui.cbH.value = cb.inner_corners_y;
     ui.cbSquare.value = cb.square_size_mm;
-    ui.cbRequired.value = cb.required_captures;
-    document.querySelectorAll(".cb-flag").forEach((flagCb) => {
-        flagCb.checked = (cb.flags & parseInt(flagCb.value, 10)) !== 0;
-    });
     _renderOverlayList();   // re-render so the active highlight updates
     _setCbFormHelp(`Editing <b>${escHtml(cb.name)}</b> — change values and click Save.`);
 }
 
 function _clearCbForm() {
-    ui.cbName.value = "";
-    ui.cbMode.value = "mono";
     ui.cbW.value = 9; ui.cbH.value = 6;
     ui.cbSquare.value = 25;
-    ui.cbRequired.value = 20;
-    document.querySelectorAll(".cb-flag").forEach((cb) => (cb.checked = false));
 }
 
 function _setCbFormHelp(html) {
@@ -470,20 +554,24 @@ function _setCbFormHelp(html) {
 }
 
 function _readCbForm() {
+    const w = Math.max(2, Math.min(30, parseInt(ui.cbW.value, 10) || 9));
+    const h = Math.max(2, Math.min(30, parseInt(ui.cbH.value, 10) || 6));
+    const sq = Math.max(0.1, parseFloat(ui.cbSquare.value) || 25);
+    // Editing an existing board: preserve its name/mode/flags/required_captures
+    // (these aren't editable here -- they're set elsewhere in the Session card).
+    // Creating a new board: derive a name from the physical params and use
+    // the documented defaults for the rest.
+    const editing = state._editingChessboard;
     return {
-        name: sanitizeName(ui.cbName.value),
-        mode: ui.cbMode.value,
-        inner_corners_x: Math.max(2, Math.min(30, parseInt(ui.cbW.value, 10) || 9)),
-        inner_corners_y: Math.max(2, Math.min(30, parseInt(ui.cbH.value, 10) || 6)),
-        square_size_mm: Math.max(0.1, parseFloat(ui.cbSquare.value) || 25),
-        required_captures: Math.max(3, Math.min(200, parseInt(ui.cbRequired.value, 10) || 20)),
-        flags: (() => {
-            let f = 0;
-            document.querySelectorAll(".cb-flag").forEach((cb) => {
-                if (cb.checked) f |= parseInt(cb.value, 10);
-            });
-            return f;
-        })(),
+        name: editing ? editing.name : sanitizeName(_cbDerivedName(w, h, sq)),
+        mode: editing ? (editing.mode || _CB_DEFAULTS.mode) : _CB_DEFAULTS.mode,
+        inner_corners_x: w,
+        inner_corners_y: h,
+        square_size_mm: sq,
+        required_captures: editing
+            ? (editing.required_captures ?? _CB_DEFAULTS.required_captures)
+            : _CB_DEFAULTS.required_captures,
+        flags: editing ? (editing.flags ?? _CB_DEFAULTS.flags) : _CB_DEFAULTS.flags,
     };
 }
 
@@ -492,14 +580,14 @@ ui.cbNew.addEventListener("click", () => {
     state._overlayOriginalName = null;
     _clearCbForm();
     _renderOverlayList();
-    _setCbFormHelp("New chessboard — fill in the form and click Save.");
-    ui.cbName.focus();
+    _setCbFormHelp("New chessboard — set the inner corners and square size, then click Save.");
+    ui.cbW.focus();
 });
 
 ui.cbSave.addEventListener("click", async () => {
     const payload = _readCbForm();
     if (!payload.name) {
-        _setCbFormHelp("Please give the chessboard a name.");
+        _setCbFormHelp("Couldn't derive a name from the values — please double-check W / H / square size.");
         return;
     }
     try {
@@ -546,6 +634,8 @@ ui.cbCancel.addEventListener("click", closeChessboardOverlay);
 
 // Auto-load on page start
 loadChessboards();
+_initLogCard();
+_initFlagInfoTooltips();
 
 // ---------- Sessions ----------
 
@@ -976,6 +1066,9 @@ function renderSessionList(sessions, health = {}) {
             </div>
         </div>`;
     }).join("");
+    // Pin to the top so the newest session is always visible (rows are
+    // already sorted newest-first above).
+    el.scrollTop = 0;
 }
 
 // ---------- Frame lightbox ----------
@@ -1020,12 +1113,96 @@ let _activeIntrinsicsId = null;
 
 const FLAG_NAMES = { 4096: "Zero tangential dist", 1024: "Fix aspect ratio", 16384: "Rational model" };
 
+// Long-form descriptions for the advanced options in the Session card.
+// Each entry explains what the flag does in OpenCV's cv2.calibrateCamera
+// and when the user should consider ticking it.  Keyed by the same string
+// used in the HTML `data-flag-desc` attribute on the .flag-info icon.
+const FLAG_DESCRIPTIONS = {
+    zero_tangential: {
+        title: "Zero tangential distortion",
+        body: "Forces the tangential distortion coefficients (p1, p2) to 0. " +
+              "Use this when the camera's lens and image sensor are perfectly " +
+              "aligned and you don't expect any de-centering error. Safe for " +
+              "most machine-vision lenses; slightly reduces the fit's degrees " +
+              "of freedom so the remaining parameters are estimated more " +
+              "robustly.",
+    },
+    fix_aspect: {
+        title: "Fix aspect ratio",
+        body: "Forces fx and fy (horizontal / vertical focal length) to be " +
+              "equal. Enable when the camera pixels are guaranteed square " +
+              "(most modern CMOS sensors) and you want a cleaner, more " +
+              "constrained intrinsic model. Off is fine for cheap lenses " +
+              "or sensors with non-square pixels.",
+    },
+    rational: {
+        title: "Rational model (k4, k5, k6)",
+        body: "Adds the higher-order radial distortion coefficients k4, k5, " +
+              "and k6. Useful for wide-angle / fisheye-style lenses where the " +
+              "standard 3-parameter (k1, k2, k3) model leaves visible barrel " +
+              "distortion. Enable when your RMS stays stubbornly above 1 px " +
+              "and you suspect the lens has strong wide-angle distortion.",
+    },
+};
+
 function decodeFlags(flags) {
     const n = parseInt(flags ?? 0, 10);
     if (n === 0) return "Default (none)";
     const active = Object.entries(FLAG_NAMES).filter(([v]) => n & parseInt(v)).map(([, name]) => name);
     return active.length ? active.join(", ") : `0x${n.toString(16)}`;
 }
+
+// Wire up the .flag-info buttons: clicking opens a centered overlay
+// window (matching the chessboard / SSH overlay pattern) with the option's
+// description.  Closes via the X, ESC, or click outside.
+function _initFlagInfoTooltips() {
+    const icons = document.querySelectorAll(".flag-info[data-flag-desc]");
+    if (!icons.length) return;
+    icons.forEach((icon) => {
+        icon.tabIndex = 0;
+        icon.setAttribute("role", "button");
+        icon.setAttribute("aria-label", "Show description for this option");
+        icon.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            openFlagOverlay(icon.dataset.flagDesc);
+        });
+    });
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") closeFlagOverlay();
+    });
+}
+
+function openFlagOverlay(key) {
+    const desc = FLAG_DESCRIPTIONS[key];
+    if (!desc) return;
+    const overlay = $("flag-info-overlay");
+    if (!overlay) return;
+    $("flag-info-title").textContent = desc.title;
+    $("flag-info-body").textContent = desc.body;
+    overlay.hidden = false;
+}
+window.openFlagOverlay = openFlagOverlay;
+
+function closeFlagOverlay() {
+    const overlay = $("flag-info-overlay");
+    if (overlay) overlay.hidden = true;
+}
+window.closeFlagOverlay = closeFlagOverlay;
+
+// Flag-info overlay: click-outside + ESC close (matches chessboard /
+// SSH overlay patterns).
+function _initFlagInfoOverlay() {
+    const overlay = $("flag-info-overlay");
+    if (!overlay) return;
+    overlay.addEventListener("click", (e) => {
+        if (e.target === overlay) closeFlagOverlay();
+    });
+    overlay.querySelectorAll("[data-overlay-close]").forEach((el) => {
+        el.addEventListener("click", closeFlagOverlay);
+    });
+}
+_initFlagInfoOverlay();
 
 function _modeLabel(mode) {
     if (!mode) return "Mono";
@@ -1244,11 +1421,7 @@ async function loadSshProfiles() {
     ui.sshProfilesList.querySelectorAll("[data-profile-edit]").forEach((btn) => {
         btn.addEventListener("click", async () => {
             const name = btn.dataset.profileEdit;
-            let all; try { all = await api("/remote/ssh-profiles"); } catch (_) { return; }
-            const p = all.find((x) => x.name === name); if (!p) return;
-            state._editingProfileName = name;
-            _fillForm(p);
-            _openForm();
+            await openSshOverlay(name);
         });
     });
 
@@ -1267,17 +1440,16 @@ async function loadSshProfiles() {
     });
 }
 
+// Sync the legacy form fields from a saved profile.  Used by the row ⏻
+// button so `_sshCreds()` returns the right values when the user clicks
+// Connect without ever opening the overlay.
 function _fillForm(p) {
-    ui.sshProfileName.value = p.name || "";
     ui.sshHost.value = p.host || "";
     ui.sshPort.value = p.port || 22;
     ui.sshUser.value = p.username || "";
     ui.sshPass.value = p.password || "";
     ui.agentPort.value = p.agent_port || 8765;
 }
-
-function _openForm() { ui.sshFormPanel.hidden = false; ui.sshProfileName.focus(); }
-function _closeForm() { ui.sshFormPanel.hidden = true; state._editingProfileName = null; }
 
 function _highlightProfile(name) {
     // Apply the active highlight class to the matching row.  The class itself
@@ -1288,15 +1460,107 @@ function _highlightProfile(name) {
     });
 }
 
-ui.sshAddConnection.addEventListener("click", () => {
+// ---------- SSH overlay (add / edit / delete saved connections) ----------
+
+function _sshOverlayRefreshList() {
+    if (!ui.sshOverlayList) return;
+    if (!state.sshProfilesCache.length) {
+        ui.sshOverlayList.innerHTML = '<div class="cb-list-empty">No connections yet — click + New connection.</div>';
+        return;
+    }
+    ui.sshOverlayList.innerHTML = state.sshProfilesCache.map((p) => {
+        const active = state._editingProfileName === p.name ? " active" : "";
+        return `
+        <div class="cb-row${active}" data-ssh-ov-name="${escHtml(p.name)}">
+            <div class="cb-row-name">${escHtml(p.name)}</div>
+            <div class="cb-row-meta">${escHtml(p.username)}@${escHtml(p.host)} · :${p.port ?? 22}</div>
+        </div>`;
+    }).join("");
+    ui.sshOverlayList.querySelectorAll("[data-ssh-ov-name]").forEach((row) => {
+        row.addEventListener("click", () => _sshOverlayLoadIntoForm(row.dataset.sshOvName));
+    });
+}
+
+function _sshOverlayClearForm() {
+    ui.sshOvName.value = "";
+    ui.sshOvHost.value = "";
+    ui.sshOvPort.value = 22;
+    ui.sshOvUser.value = "";
+    ui.sshOvPass.value = "";
+    ui.sshOvAgentPort.value = 8765;
+}
+
+function _sshOverlayLoadIntoForm(name) {
+    const p = state.sshProfilesCache.find((x) => x.name === name);
+    if (!p) return;
+    state._editingProfileName = p.name;
+    ui.sshOvName.value = p.name;
+    ui.sshOvHost.value = p.host || "";
+    ui.sshOvPort.value = p.port || 22;
+    ui.sshOvUser.value = p.username || "";
+    ui.sshOvPass.value = p.password || "";
+    ui.sshOvAgentPort.value = p.agent_port || 8765;
+    _sshOverlayRefreshList();
+    if (ui.sshOverlayFormHelp) {
+        ui.sshOverlayFormHelp.innerHTML =
+            `Editing <b>${escHtml(p.name)}</b> — change values and click Save.`;
+    }
+}
+
+function _sshOverlaySetHelp(html) {
+    if (ui.sshOverlayFormHelp) ui.sshOverlayFormHelp.innerHTML = html;
+}
+
+async function _sshOverlayFetchAll() {
+    try { state.sshProfilesCache = await api("/remote/ssh-profiles"); }
+    catch (_) { state.sshProfilesCache = []; }
+}
+
+async function openSshOverlay(editName) {
+    await _sshOverlayFetchAll();
     state._editingProfileName = null;
-    _fillForm({ name: "", host: "", port: 22, username: "", password: "", agent_port: 8765 });
-    _openForm();
+    _sshOverlayRefreshList();
+    if (editName) {
+        _sshOverlayLoadIntoForm(editName);
+    } else {
+        _sshOverlayClearForm();
+        _sshOverlaySetHelp("New connection — fill in the form and click Save.");
+        ui.sshOvName.focus();
+    }
+    ui.sshOverlay.hidden = false;
+}
+
+function closeSshOverlay() {
+    ui.sshOverlay.hidden = true;
+    state._editingProfileName = null;
+}
+window.openSshOverlay = openSshOverlay;
+window.closeSshOverlay = closeSshOverlay;
+
+ui.sshManage.addEventListener("click", () => openSshOverlay(null));
+// Click outside the dialog closes it
+ui.sshOverlay.addEventListener("click", (e) => { if (e.target === ui.sshOverlay) closeSshOverlay(); });
+// ESC closes the overlay (only if not already handled by the chessboard overlay)
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !ui.sshOverlay.hidden) closeSshOverlay();
 });
 
-ui.sshSaveProfile.addEventListener("click", async () => {
-    const name = ui.sshProfileName.value.trim() || ui.sshHost.value.trim();
-    if (!name) { ui.hint.textContent = "Enter a connection name to save."; return; }
+ui.sshOverlayNew.addEventListener("click", () => {
+    state._editingProfileName = null;
+    _sshOverlayClearForm();
+    _sshOverlayRefreshList();
+    _sshOverlaySetHelp("New connection — fill in the form and click Save.");
+    ui.sshOvName.focus();
+});
+
+ui.sshOverlaySave.addEventListener("click", async () => {
+    const name = ui.sshOvName.value.trim() || ui.sshOvHost.value.trim();
+    if (!name) {
+        _sshOverlaySetHelp("Please give the connection a name.");
+        return;
+    }
+    const port = parseInt(ui.sshOvPort.value, 10) || 22;
+    const agentPort = parseInt(ui.sshOvAgentPort.value, 10) || 8765;
     try {
         if (state._editingProfileName && state._editingProfileName !== name) {
             await api(`/remote/ssh-profiles/${encodeURIComponent(state._editingProfileName)}`, { method: "DELETE" });
@@ -1305,24 +1569,51 @@ ui.sshSaveProfile.addEventListener("click", async () => {
             method: "POST",
             body: JSON.stringify({
                 name,
-                host: ui.sshHost.value.trim(),
-                port: parseInt(ui.sshPort.value, 10) || 22,
-                username: ui.sshUser.value.trim(),
-                password: ui.sshPass.value,
-                agent_port: parseInt(ui.agentPort.value, 10) || 8765,
+                host: ui.sshOvHost.value.trim(),
+                port,
+                username: ui.sshOvUser.value.trim(),
+                password: ui.sshOvPass.value,
+                agent_port: agentPort,
             }),
         });
-        ui.hint.textContent = `Profile "${name}" saved.`;
-        _closeForm();
+        ui.hint.textContent = `Connection "${name}" saved.`;
+        // Sync the legacy form fields so a subsequent ⏻ click on the row
+        // picks up the same creds without needing the user to re-open the
+        // overlay.
+        _fillForm({ host: ui.sshOvHost.value, port, username: ui.sshOvUser.value,
+                    password: ui.sshOvPass.value, agent_port: agentPort });
+        state._editingProfileName = name;
+        await _sshOverlayFetchAll();
+        _sshOverlayRefreshList();
+        _sshOverlayLoadIntoForm(name);
         await loadSshProfiles();
-        _highlightProfile(name);
-        ui.sshToggleConn.disabled = false;
     } catch (err) {
-        ui.hint.textContent = "Save failed: " + err.message;
+        _sshOverlaySetHelp("Save failed: " + err.message);
     }
 });
 
-ui.sshCancelForm.addEventListener("click", _closeForm);
+ui.sshOverlayDelete.addEventListener("click", async () => {
+    const name = state._editingProfileName;
+    if (!name) {
+        _sshOverlaySetHelp("Pick a connection from the list to delete.");
+        return;
+    }
+    if (!confirm(`Delete connection "${name}"?`)) return;
+    try {
+        await api(`/remote/ssh-profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
+        ui.hint.textContent = `Connection "${name}" deleted.`;
+        state._editingProfileName = null;
+        _sshOverlayClearForm();
+        await _sshOverlayFetchAll();
+        _sshOverlayRefreshList();
+        _sshOverlaySetHelp("Pick a connection from the list, or click + New connection.");
+        await loadSshProfiles();
+    } catch (err) {
+        _sshOverlaySetHelp("Delete failed: " + err.message);
+    }
+});
+
+ui.sshOverlayCancel.addEventListener("click", closeSshOverlay);
 
 loadSshProfiles();
 
@@ -1353,7 +1644,6 @@ function _resetRemoteState() {
     _stopCameraPoll();
     _stopAgentHealthPoll();
     _stopAgentLog();
-    if (ui.agentLog) { ui.agentLog.textContent = ""; ui.agentLog.hidden = true; }
 }
 
 // ---------- Agent heartbeat poll ----------
@@ -1475,15 +1765,13 @@ async function _recheckAgent() {
     }
 }
 
-async function _runSseJob(url, logEl) {
-    logEl.hidden = false;
-    logEl.textContent = "";
+async function _runSseJob(url, source) {
+    // Stream an SSE job (install / reinstall / uninstall / etc.) into the
+    // shared Logs card, tagged with ``source`` so the tab filter can show /
+    // hide it.  Returns true on the "DONE:" sentinel, false on error.
+    const append = (line) => _log(source, line);
+    append(`--- ${url} ---`);
     let success = false;
-    const append = (line) => {
-        logEl.hidden = false;
-        logEl.textContent += line + "\n";
-        logEl.scrollTop = logEl.scrollHeight;
-    };
     try {
         const resp = await fetch(url, {
             method: "POST",
@@ -1517,21 +1805,21 @@ async function _runSseJob(url, logEl) {
 ui.installAgentBtn.addEventListener("click", async () => {
     ui.installAgentBtn.disabled = true;
     ui.hint.textContent = "Installing agent …";
-    const ok = await _runSseJob("/remote/ssh-install", ui.installLog);
+    const ok = await _runSseJob("/remote/ssh-install", "install");
     ui.installAgentBtn.disabled = false;
     if (ok) { await _recheckAgent(); }
-    else { ui.hint.textContent = "Installation failed — see log above."; }
+    else { ui.hint.textContent = "Installation failed — see Logs panel below."; }
 });
 
 ui.reinstallAgentBtn.addEventListener("click", async () => {
     ui.reinstallAgentBtn.disabled = true;
     ui.enableAgentBtn.disabled = true;
     ui.hint.textContent = "Reinstalling agent …";
-    const ok = await _runSseJob("/remote/ssh-install", ui.manageLog);
+    const ok = await _runSseJob("/remote/ssh-install", "manage");
     ui.reinstallAgentBtn.disabled = false;
     ui.enableAgentBtn.disabled = false;
     if (ok) { await _recheckAgent(); ui.hint.textContent = "Agent reinstalled."; }
-    else { ui.hint.textContent = "Reinstall failed — see log above."; }
+    else { ui.hint.textContent = "Reinstall failed — see Logs panel below."; }
 });
 
 ui.removeAgentBtn.addEventListener("click", async () => {
@@ -1539,7 +1827,7 @@ ui.removeAgentBtn.addEventListener("click", async () => {
     ui.removeAgentBtn.disabled = true;
     ui.enableAgentBtn.disabled = true;
     ui.hint.textContent = "Removing agent …";
-    const ok = await _runSseJob("/remote/ssh-uninstall", ui.manageLog);
+    const ok = await _runSseJob("/remote/ssh-uninstall", "manage");
     ui.removeAgentBtn.disabled = false;
     ui.enableAgentBtn.disabled = false;
     if (ok) {
@@ -1548,24 +1836,18 @@ ui.removeAgentBtn.addEventListener("click", async () => {
         _showAgentPanel("agent-not-installed-panel");
         ui.hint.textContent = "Agent removed from remote.";
     } else {
-        ui.hint.textContent = "Removal failed — see log above.";
+        ui.hint.textContent = "Removal failed — see Logs panel below.";
     }
 });
 
 // ---------- Enable Agent ----------
 
 function _appendAgentLog(line) {
-    ui.agentLog.hidden = false;
     if (line === "__READY__") {
-        ui.agentLog.textContent += "── live tail ──\n";
+        _log("agent", "── live tail ──");
     } else {
-        ui.agentLog.textContent += line + "\n";
-        const lines = ui.agentLog.textContent.split("\n");
-        if (lines.length > 450) {
-            ui.agentLog.textContent = lines.slice(lines.length - 400).join("\n");
-        }
+        _log("agent", line);
     }
-    ui.agentLog.scrollTop = ui.agentLog.scrollHeight;
 }
 
 function _stopAgentLog() {
@@ -1577,8 +1859,7 @@ function _stopAgentLog() {
 
 function _startAgentLog(agentId) {
     _stopAgentLog();
-    ui.agentLog.hidden = false;
-    ui.agentLog.textContent = "Connecting to remote log stream …\n";
+    _log("agent", "Connecting to remote log stream …");
     const es = new EventSource(`/remote/agent/${agentId}/log`);
     state.agentLogSource = es;
     es.onmessage = (e) => {

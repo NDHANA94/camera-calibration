@@ -29,7 +29,16 @@ main { padding: 16px; overflow: auto; display: flex; flex-direction: column; gap
     font-size: 11px; font-weight: 700; margin: 0 0 8px; color: var(--muted);
     text-transform: uppercase; letter-spacing: 0.06em;
 }
-aside.rightbar { background: var(--panel); padding: 14px; overflow-y: auto; border-left: 1px solid #111; }
+aside.rightbar {
+    background: var(--panel); padding: 14px;
+    /* No outer scroll -- each card scrolls internally so the panel layout
+       stays fixed regardless of how much history or log content there is. */
+    overflow: hidden;
+    border-left: 1px solid #111;
+    display: flex; flex-direction: column;
+    /* Cap at the viewport so the cards always stay inside view. */
+    min-height: 0;
+}
 
 @media (max-width: 1400px) {
     .app { grid-template-columns: 280px 1fr; }
@@ -243,21 +252,33 @@ details.advanced[open] summary::before { content: "▾ "; }
     max-height: 320px; overflow-y: auto;
 }
 
-/* Sessions list panel */
-details.sessions-panel {
-    margin-top: 14px; background: var(--panel); border-radius: 6px; overflow: hidden;
+/* Sessions (history) card -- right-panel history list.  Wrapped in a
+   .card so it matches the other right-panel cards.  Fixed in position:
+   always visible regardless of how many sessions there are.  The body
+   scrolls internally; the panel itself never scrolls. */
+.sessions-card {
+    margin-top: 14px;
+    /* History takes the lion's share: roughly 60% of the right panel.
+       min-height so it's never uselessly tiny. */
+    flex: 6 1 0;
+    min-height: 0;          /* allow flex to shrink below content */
+    min-height: 200px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
 }
-details.sessions-panel > summary {
+.sessions-card-head {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 8px 12px; font-size: 12px; font-weight: 600; color: var(--muted);
-    text-transform: uppercase; letter-spacing: 0.06em;
-    cursor: pointer; user-select: none; list-style: none;
+    margin-bottom: 8px;
 }
-details.sessions-panel > summary::-webkit-details-marker { display: none; }
-details.sessions-panel > summary::before { content: "▸ "; font-size: 10px; }
-details.sessions-panel[open] > summary::before { content: "▾ "; }
-
-#sessions-list { padding: 0 0 4px; }
+.sessions-card-title {
+    font-size: 11px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.06em;
+}
+.sessions-list-body {
+    /* Fill the rest of the card; scroll internally when sessions overflow. */
+    flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0 0 4px;
+}
 .session-empty { display: block; padding: 8px 14px; font-size: 12px; color: var(--muted); }
 
 .session-row {
@@ -418,3 +439,92 @@ details.sessions-panel[open] > summary::before { content: "▾ "; }
 .ssh-profile-active .ssh-profile-btn[data-profile-toggle]:hover {
     filter: brightness(1.12);
 }
+
+/* ---------- Log card (right panel, bottom) ---------- */
+/* The logs card is always visible (not collapsible) so log output is never
+   hidden.  It uses the same .card chrome as the other right-panel cards. */
+.log-panel {
+    /* override the default .card margin-bottom so it sits flush */
+    margin-bottom: 0;
+    /* Log card is shorter than history but still scrolls internally so
+       new lines can be appended forever. */
+    flex: 3 1 0;
+    min-height: 0;          /* allow flex to shrink below content */
+    min-height: 130px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+.log-panel-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 6px; margin-bottom: 8px;
+}
+.log-panel-title {
+    font-size: 11px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.06em;
+}
+
+/* Source-filter tab strip inside the header.  Looks like a small pill
+   group instead of free-floating buttons. */
+.log-source-tabs {
+    display: inline-flex; gap: 1px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 1px; margin-left: auto; margin-right: auto;
+}
+.log-source-tab {
+    margin: 0; padding: 2px 8px; font-size: 11px; line-height: 1.3;
+    font-weight: 600; letter-spacing: 0.02em; text-transform: none;
+    background: transparent; color: var(--muted);
+    border: 0; border-radius: 3px; cursor: pointer;
+}
+.log-source-tab:hover { color: var(--text); background: var(--panel-2); }
+.log-source-tab.active {
+    background: var(--accent); color: white;
+}
+
+/* The log body.  Always smaller than the history card above.  The
+   card itself is sized via flex; the body fills whatever vertical space
+   the card has, scrolling internally when new lines overflow. */
+.log-body {
+    margin: 0 10px 10px; overflow-y: auto;
+    flex: 1 1 auto; min-height: 0;
+    font-size: 11px; line-height: 1.45;
+}
+
+/* ---------- Flag info overlay (single-column centered dialog) ---------- */
+.overlay-dialog-narrow { max-width: 480px; width: 92vw; }
+/* Override the default 2-column grid on .overlay-body so the description
+   fills the full width of the dialog instead of sitting in the second
+   column with empty space on the right. */
+.overlay-body.overlay-body-single {
+    display: block;
+    grid-template-columns: none;
+    min-height: 0;
+    padding: 18px 22px 22px;
+}
+.flag-info-body-text {
+    margin: 0; font-size: 13.5px; line-height: 1.6; color: var(--text);
+    white-space: pre-wrap;
+    width: 100%;
+    max-width: 100%;
+}
+
+/* ---------- Flag info icon (clickable ⓘ in advanced option rows) ---------- */
+.flag-info {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: var(--panel-2); color: var(--muted);
+    font-size: 11px; font-weight: 700; line-height: 1;
+    cursor: pointer; user-select: none;
+    border: 1px solid var(--border);
+    transition: background 0.15s, color 0.15s;
+    margin-left: auto;
+    flex-shrink: 0;
+}
+.flag-info:hover, .flag-info:focus,
+.flag-info:active {
+    background: var(--accent); color: white; border-color: var(--accent);
+    outline: none;
+}
+.flag-row-label { flex: 1 1 auto; min-width: 0; }
