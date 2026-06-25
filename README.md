@@ -182,7 +182,7 @@ server/data/
     └── meta.json                           RMS, reprojection error, baseline…
 ```
 
-SSH connection profiles are stored alongside the data dir in `ssh_profiles.json`.
+Saved SSH connection profiles live in `server/data/ssh_profiles.json`.
 
 ## HTTP API (overview)
 
