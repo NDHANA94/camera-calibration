@@ -165,7 +165,7 @@ details.advanced[open] summary::before { content: "▾ "; }
 
 /* Middle-panel views: live / detail-result / placeholder are mutually exclusive */
 #live-view { display: flex; flex-direction: column; gap: 10px; }
-#live-view[hidden], #detail-panel[hidden], #middle-placeholder[hidden] { display: none; }
+#live-view[hidden], #detail-panel[hidden], #backproject-panel[hidden], #middle-placeholder[hidden] { display: none; }
 
 .middle-placeholder {
     flex: 1; display: flex; align-items: center; justify-content: center;
@@ -528,3 +528,109 @@ details.advanced[open] summary::before { content: "▾ "; }
     outline: none;
 }
 .flag-row-label { flex: 1 1 auto; min-width: 0; }
+
+/* ============================================================
+   Back-projection & Depth-prediction tools (two middle-panel views)
+   ============================================================ */
+#backproject-panel[hidden], #depth-panel[hidden] { display: none; }
+.bp-panel { display: flex; flex-direction: column; min-height: 0; max-height: 100%; }
+
+.bp-head-title { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; min-width: 0; }
+.bp-head-title > span:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bp-head-actions { display: flex; gap: 6px; align-items: center; flex: 0 0 auto; }
+
+.bp-body {
+    padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px;
+    min-height: 0;
+}
+
+/* Cards inside the tool */
+.bp-card { background: var(--panel-2); border: 1px solid #3a3f48; border-radius: 8px; padding: 11px 12px; }
+.bp-card[hidden] { display: none; }
+.bp-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 9px; }
+.bp-card-title { font-size: 10px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.07em; }
+.bp-card-tools { display: flex; gap: 6px; align-items: center; }
+
+/* Source/agent status row with a live dot */
+.bp-status-row { display: flex; align-items: center; gap: 9px; margin-bottom: 11px; }
+.bp-dot {
+    width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: 0 0 auto;
+    box-shadow: 0 0 0 3px rgba(255,255,255,0.04);
+}
+.bp-dot.ok   { background: var(--ok); }
+.bp-dot.warn { background: var(--warn); }
+.bp-dot.bad  { background: var(--danger); }
+.bp-dot.live { background: var(--ok); animation: bp-pulse 1.4s infinite; }
+@keyframes bp-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(69,208,122,0.55); }
+    50%      { box-shadow: 0 0 0 5px rgba(69,208,122,0); }
+}
+.bp-status-text { font-size: 12.5px; line-height: 1.4; color: var(--text); }
+
+/* Segmented control (Live / Captured) */
+.bp-seg { display: inline-flex; background: var(--bg); border: 1px solid #3a3f48; border-radius: 7px; padding: 2px; gap: 2px; }
+.bp-seg-btn {
+    background: transparent; color: var(--muted); border: 0; padding: 6px 13px;
+    font-size: 12.5px; border-radius: 5px; cursor: pointer; line-height: 1.2;
+}
+.bp-seg-btn:not(:disabled):hover { color: var(--text); }
+.bp-seg-btn.active { background: var(--accent); color: #fff; }
+.bp-seg-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Camera / frame selector fields */
+.bp-fields { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 11px; }
+.bp-field { display: flex; flex-direction: column; gap: 4px; font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.bp-field[hidden] { display: none; }
+.bp-field select { min-width: 190px; text-transform: none; letter-spacing: 0; }
+
+/* Stage (video / image canvas) */
+.bp-stage {
+    position: relative; background: #000; border-radius: 8px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center; min-height: 200px;
+}
+.bp-stage canvas { width: 100%; height: auto; display: block; }
+#bp-canvas { cursor: crosshair; }
+.bp-stage-overlay {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; color: var(--muted); font-size: 13px; line-height: 1.5; padding: 24px;
+    pointer-events: none; background: rgba(0,0,0,0.35);
+}
+.bp-stage-overlay[hidden] { display: none; }
+.bp-spinner {
+    position: absolute; width: 30px; height: 30px; border: 3px solid rgba(255,255,255,0.2);
+    border-top-color: var(--accent); border-radius: 50%; animation: bp-spin 0.8s linear infinite;
+}
+.bp-spinner[hidden] { display: none; }
+@keyframes bp-spin { to { transform: rotate(360deg); } }
+.bp-box-info { font-size: 11.5px; color: var(--muted); margin-top: 7px; min-height: 15px; font-family: ui-monospace, SFMono-Regular, monospace; }
+
+/* Extrinsics editor */
+.bp-ext-grid { display: flex; flex-wrap: wrap; gap: 18px; }
+.bp-ext-group { display: flex; flex-direction: column; gap: 6px; }
+.bp-ext-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.bp-ext-inputs { display: flex; gap: 7px; }
+.bp-ext-inputs label { display: flex; flex-direction: column; gap: 3px; font-size: 10px; color: var(--muted); text-align: center; }
+.bp-ext-inputs input { width: 76px; }
+.bp-compute-btn { margin-top: 11px; }
+
+/* Ray result */
+.bp-result {
+    margin-top: 11px; background: var(--bg); border: 1px solid #3a3f48; border-radius: 6px;
+    padding: 4px 11px; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px;
+}
+.bp-result[hidden] { display: none; }
+.bp-result-row { display: flex; justify-content: space-between; gap: 14px; padding: 5px 0; border-bottom: 1px solid #2a2e35; }
+.bp-result-row:last-child { border-bottom: none; }
+.bp-result-row .k { color: var(--muted); white-space: nowrap; }
+.bp-result-row .v { color: var(--text); text-align: right; word-break: break-all; }
+
+/* Depth heatmap + colorbar */
+.bp-depth-readout { font-size: 12px; color: var(--text); font-family: ui-monospace, SFMono-Regular, monospace; }
+.bp-colorbar-wrap { display: flex; align-items: center; gap: 9px; margin-top: 9px; }
+.bp-colorbar {
+    flex: 1 1 auto; height: 12px; border-radius: 3px;
+    background: linear-gradient(to right, #800000, #ff0000, #ff8c00, #ffe000, #46d07a, #00d0d0, #2a6fff, #000080);
+}
+.bp-cb-label { font-size: 11px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, monospace; white-space: nowrap; min-width: 56px; }
+.bp-cb-label.far { text-align: right; }
+.bp-hint-line { font-size: 11px; color: var(--muted); margin-top: 7px; }

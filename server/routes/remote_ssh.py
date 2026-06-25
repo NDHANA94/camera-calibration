@@ -251,7 +251,9 @@ async def ssh_enable(payload: SshEnablePayload, request: Request) -> dict:
     # Start the heartbeat: the host periodically health-checks the agent over
     # the SSH tunnel.  If the heartbeat is lost (network down, agent crashed,
     # box powered off) the agent is marked DOWN so the UI can react.
-    state.last_heartbeat = asyncio.get_event_loop().time()
+    now = asyncio.get_event_loop().time()
+    state.last_heartbeat = now
+    state.last_viewer_seen = now
     state.heartbeat_task = asyncio.create_task(_heartbeat_loop(agent_id))
 
     return {"agent_id": agent_id, "server_url": server_base}
@@ -261,6 +263,11 @@ async def ssh_enable(payload: SshEnablePayload, request: Request) -> dict:
 # before we declare it DOWN.  ~3 x 5 s ≈ 15 s to detect a dead agent.
 HEARTBEAT_INTERVAL_S = 5.0
 HEARTBEAT_MAX_FAILURES = 3
+
+# How long the browser's status poll can be silent before we conclude the
+# page was closed/reloaded and tear the agent down (releasing the remote
+# camera).  The browser polls /agent/{id}/status every 5 s, so 3 missed polls.
+VIEWER_TIMEOUT_S = 15.0
 
 
 async def _ping_agent(state, timeout: float = 5.0) -> bool:
@@ -298,6 +305,13 @@ async def _heartbeat_loop(agent_id: str) -> None:
         state = agent_registry.get(agent_id)
         if state is None:
             return  # agent already gone (disabled / re-enabled)
+        # If the browser stopped polling (page closed / reloaded / refreshed),
+        # the viewer is gone -- stop the agent so the remote camera is released.
+        now = asyncio.get_event_loop().time()
+        if state.last_viewer_seen and (now - state.last_viewer_seen) > VIEWER_TIMEOUT_S:
+            log.info("agent %s viewer gone -- stopping agent", agent_id)
+            agent_registry.unregister(agent_id)  # kills process, releases camera
+            return
         if await _ping_agent(state):
             fails = 0
             state.last_heartbeat = asyncio.get_event_loop().time()
@@ -320,6 +334,9 @@ async def agent_status(agent_id: str) -> dict:
     state = agent_registry.get(agent_id)
     if state is not None:
         now = asyncio.get_event_loop().time()
+        # The browser polls this endpoint every 5 s; treat each poll as a
+        # sign the page is still open so the heartbeat loop keeps the agent up.
+        state.last_viewer_seen = now
         return {
             "alive": True, "down": False, "reason": None,
             "connected": state.cameras_ready.is_set(),

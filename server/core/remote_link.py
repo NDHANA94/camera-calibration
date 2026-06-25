@@ -103,6 +103,11 @@ class AgentState:
     # the background task that runs the heartbeat loop.
     last_heartbeat: float = 0.0
     heartbeat_task: object = None
+    # Monotonic time of the last sign of life from the browser (its status
+    # poll).  When the page is closed / reloaded the poll stops; the heartbeat
+    # loop notices the staleness and tears the agent down so the remote camera
+    # is released.
+    last_viewer_seen: float = 0.0
 
 
 class RemoteAgentRegistry:

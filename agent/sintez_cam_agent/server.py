@@ -41,6 +41,18 @@ log = logging.getLogger(__name__)
 
 AGENT_VERSION = "0.3.0"
 
+# Self-watchdog: the host (calibration server) health-checks us every ~5 s over
+# the SSH tunnel.  If we hear nothing for this long, the host is gone (server
+# died, SSH dropped, page closed and the server unregistered us) -- shut down so
+# the engaged camera is released instead of being held forever.  Generous vs.
+# the server's own 15 s viewer timeout so normal teardown wins; this only fires
+# on true host loss.
+AGENT_WATCHDOG_TIMEOUT_S = 25.0
+
+# Monotonic time of the last contact from the host (any HTTP/WS request).  Bumped
+# in _handle_connection; the /healthz pings keep it fresh while the host is alive.
+_last_activity: float = time.monotonic()
+
 
 # ---------------------------------------------------------------------------
 # Tiny WebSocket server (RFC 6455, server side, no TLS, no extensions)
@@ -368,6 +380,8 @@ async def _dual_stream_loop(
 
 async def _handle_connection(reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter) -> None:
+    global _last_activity
+    _last_activity = time.monotonic()
     peer = writer.get_extra_info("peername")
     log.debug("connection from %r", peer)
     try:
@@ -492,15 +506,32 @@ async def _handle_connection(reader: asyncio.StreamReader,
 # Public server
 # ---------------------------------------------------------------------------
 
+async def _watchdog_loop() -> None:
+    """Self-terminate (releasing the camera) if the host stops contacting us."""
+    global _last_activity
+    _last_activity = time.monotonic()  # grace period from startup
+    while True:
+        await asyncio.sleep(5)
+        if time.monotonic() - _last_activity > AGENT_WATCHDOG_TIMEOUT_S:
+            log.warning(
+                "no host contact for %.0fs -- shutting down, releasing camera",
+                AGENT_WATCHDOG_TIMEOUT_S,
+            )
+            # The OS frees the V4L2 fd held by the stream loop on process exit.
+            os._exit(0)
+
+
 async def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
     install_log_broker()
     srv = await asyncio.start_server(_handle_connection, host=host, port=port)
     log.info("agent server listening on %s:%d (pid=%d)", host, port, os.getpid())
+    watchdog = asyncio.ensure_future(_watchdog_loop())
     try:
         await srv.serve_forever()
     except asyncio.CancelledError:
         pass
     finally:
+        watchdog.cancel()
         srv.close()
         await srv.wait_closed()
 

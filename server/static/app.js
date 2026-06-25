@@ -182,6 +182,8 @@ ui.tabs.forEach((btn) => {
 function setMiddleView(which) {
     $("live-view").hidden = which !== "live";
     $("detail-panel").hidden = which !== "detail";
+    $("backproject-panel").hidden = which !== "backproject";
+    $("depth-panel").hidden = which !== "depth";
     $("middle-placeholder").hidden = which !== "placeholder";
 }
 
@@ -1229,6 +1231,8 @@ async function renderSessionDetail(sessionId) {
     $("detail-title").textContent = "Loading…";
     $("detail-body").innerHTML = "";
     $("copy-intrinsics").hidden = true;
+    $("test-backproject").hidden = true;
+    $("test-depth").hidden = true;
     setMiddleView("detail");
 
     try {
@@ -1295,6 +1299,8 @@ async function renderSessionDetail(sessionId) {
                     <pre class="yaml-block" id="intrinsics-yaml">${escHtml(intr.yaml)}</pre>
                 </div>`);
                 $("copy-intrinsics").hidden = false;
+                $("test-backproject").hidden = false;
+                $("test-depth").hidden = !String((detail.profile || {}).mode || "").startsWith("stereo");
             } catch (_) {}
         }
     } catch (err) {
@@ -1327,6 +1333,531 @@ $("copy-intrinsics").addEventListener("click", () => {
 function escHtml(s) {
     return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+
+// ---------- Back-projection & Depth-prediction tools ----------
+// Two separate middle-panel windows ("Back-projection" and "Depth prediction")
+// that share the same plumbing — frame source, agent/camera detection, live
+// streaming, bbox drawing.  Each is bound to its own panel through a "view"
+// object so the code stays DRY while the windows stay independent.
+
+function _mkBpView(prefix, mode) {
+    return {
+        prefix, mode,                 // "bp"/"ray" or "dp"/"depth"
+        sessionId: null, source: "local", name: "",
+        sessionCameraId: null, sessionCameraId2: null,
+        cameraId: null, cameraId2: null,
+        stereo: false, stereoSeparate: false,
+        frameSource: "live", frames: [], frameName: null,
+        streaming: false, es: null,
+        frozen: false, lastImg: null, lastFrameB64: null,
+        imgW: 0, imgH: 0, bbox: null, drag: null,
+        agentAlive: false, cameras: [], statusTimer: null,
+    };
+}
+const _rayView = _mkBpView("bp", "ray");
+const _depthView = _mkBpView("dp", "depth");
+function _bpEl(v, suffix) { return document.getElementById(v.prefix + "-" + suffix); }
+function _bpById(v) { return v === "dp" ? _depthView : _rayView; }
+
+// ----- status / source rendering -------------------------------------------
+
+function _bpSetStatus(v, dotClass, text) {
+    _bpEl(v, "status-dot").className = "bp-dot " + dotClass;
+    _bpEl(v, "status").textContent = text;
+}
+
+function _bpSetOverlay(v, text) {
+    const o = _bpEl(v, "stage-overlay");
+    if (text) { o.textContent = text; o.hidden = false; } else { o.hidden = true; }
+}
+
+// Decide dot colour, status text, which fields show, and whether Start is
+// enabled — based on the live source/agent/camera state.
+function _bpRenderSource(v) {
+    const live = v.frameSource === "live";
+    _bpEl(v, "src-live").classList.toggle("active", live);
+    _bpEl(v, "src-captured").classList.toggle("active", !live);
+    _bpEl(v, "src-captured").disabled = v.frames.length === 0;
+
+    const remoteLive = live && v.source === "remote";
+    _bpEl(v, "camera-field").hidden = !remoteLive;
+    _bpEl(v, "camera-2-field").hidden = !(remoteLive && v.stereoSeparate);
+    _bpEl(v, "frame-field").hidden = live;
+    _bpEl(v, "refresh-cams").hidden = !remoteLive;
+    _bpEl(v, "start").hidden = !live;
+    _bpEl(v, "capture").hidden = !live;
+
+    let startEnabled = false;
+    if (!live) {
+        if (v.frames.length === 0) _bpSetStatus(v, "bad", "No saved calibration frames for this session.");
+        else _bpSetStatus(v, "ok", `Using saved calibration frames · ${v.frames.length} available.`);
+    } else if (v.source === "local") {
+        if (!v.sessionCameraId) {
+            _bpSetStatus(v, "bad", "This local session has no camera recorded — switch to a captured image.");
+        } else {
+            startEnabled = true;
+            _bpSetStatus(v, v.streaming ? "live" : "ok",
+                v.streaming ? "Streaming live…" : `Local camera ${v.sessionCameraId} — press Start camera.`);
+        }
+    } else if (!state.remoteAgentId) {
+        _bpSetStatus(v, "bad", "Remote agent not connected — enable it on the Remote tab, or use a captured image.");
+    } else if (!v.agentAlive) {
+        _bpSetStatus(v, "bad", "Remote agent is down — re-enable it on the Remote tab, or use a captured image.");
+    } else if (v.cameras.length === 0) {
+        _bpSetStatus(v, "warn", "Agent connected, but no cameras detected — try ↻ Cameras.");
+    } else if (v.stereoSeparate && v.cameras.length < 2) {
+        _bpSetStatus(v, "warn", "Stereo (2 cameras) needs two cameras; only one detected.");
+    } else {
+        startEnabled = true;
+        _bpSetStatus(v, v.streaming ? "live" : "ok",
+            v.streaming ? "Streaming live…" : `Agent connected · ${v.cameras.length} camera(s) detected.`);
+    }
+    _bpEl(v, "start").disabled = !(startEnabled || v.streaming);
+}
+
+function _bpFillCameras(v) {
+    const fill = (sel, preferred) => {
+        const prev = sel.value;
+        sel.innerHTML = "";
+        v.cameras.forEach((c) => {
+            const o = document.createElement("option");
+            o.value = c.id; o.textContent = c.label || c.id; sel.appendChild(o);
+        });
+        if (prev && v.cameras.some((c) => c.id === prev)) sel.value = prev;
+        else if (preferred && v.cameras.some((c) => c.id === preferred)) sel.value = preferred;
+    };
+    fill(_bpEl(v, "camera"), v.sessionCameraId);
+    if (v.stereoSeparate) {
+        const sel2 = _bpEl(v, "camera-2");
+        fill(sel2, v.sessionCameraId2);
+        if (sel2.value === _bpEl(v, "camera").value && v.cameras.length >= 2) sel2.selectedIndex = 1;
+    }
+}
+
+// Poll the agent/cameras while a remote view is open so the UI stays live.
+async function _bpRefreshAgent(v, manual) {
+    if (v.source !== "remote") { _bpRenderSource(v); return; }
+    if (!state.remoteAgentId) { v.agentAlive = false; v.cameras = []; _bpRenderSource(v); return; }
+    try {
+        const st = await api(`/remote/agent/${state.remoteAgentId}/status`);
+        v.agentAlive = !!st.alive;
+    } catch (_) { v.agentAlive = false; }
+    if (v.agentAlive) {
+        try {
+            const r = await api(`/remote/agent/${state.remoteAgentId}/cameras${manual ? "?refresh=1" : ""}`);
+            v.cameras = r.cameras || [];
+        } catch (_) { v.cameras = []; }
+    } else {
+        v.cameras = [];
+    }
+    _bpFillCameras(v);
+    _bpRenderSource(v);
+}
+
+function _bpStartPolling(v) {
+    _bpStopPolling(v);
+    if (v.source !== "remote") return;
+    v.statusTimer = setInterval(() => {
+        if ($(v.prefix === "dp" ? "depth-panel" : "backproject-panel").hidden) { _bpStopPolling(v); return; }
+        if (v.frameSource === "live") _bpRefreshAgent(v, false);
+    }, 5000);
+}
+function _bpStopPolling(v) {
+    if (v.statusTimer) { clearInterval(v.statusTimer); v.statusTimer = null; }
+}
+
+// ----- open / close ---------------------------------------------------------
+
+async function _bpOpen(v, sessionId) {
+    _bpStop(v);
+    _bpStopPolling(v);
+    Object.assign(v, {
+        sessionId, frozen: false, lastImg: null, lastFrameB64: null,
+        bbox: null, drag: null, cameraId: null, cameraId2: null,
+        frames: [], frameName: null, agentAlive: false, cameras: [],
+        frameSource: "live",
+    });
+    setMiddleView(v.mode === "depth" ? "depth" : "backproject");
+    _bpEl(v, "title").textContent = v.mode === "depth" ? "Depth prediction" : "Back-projection";
+    _bpSetStatus(v, "muted", "Loading session…");
+    _bpEl(v, "capture").disabled = true;
+    _bpEl(v, "clearbox").disabled = true;
+    _bpEl(v, "box-info").textContent = "";
+    _bpSetOverlay(v, "Loading…");
+    if (v.mode === "ray") { _bpEl(v, "result").hidden = true; }
+    if (v.mode === "depth") { _bpEl(v, "depth-readout").textContent = ""; _bpClearDepthCanvas(v); }
+
+    let detail;
+    try {
+        detail = await api(`/sessions/${sessionId}/detail`);
+    } catch (err) {
+        _bpSetStatus(v, "bad", "Failed to load session: " + err.message);
+        _bpSetOverlay(v, "Could not load the session.");
+        return;
+    }
+    v.source = detail.source;
+    v.name = detail.name;
+    v.frames = detail.frames || [];
+    v.sessionCameraId = detail.camera_id || null;
+    v.sessionCameraId2 = detail.camera_id_2 || null;
+    const mode = (detail.profile && detail.profile.mode) || "mono";
+    v.stereo = mode.startsWith("stereo");
+    v.stereoSeparate = mode === "stereo_separate";
+
+    // Header badges
+    _bpEl(v, "title").textContent =
+        (v.mode === "depth" ? "Depth — " : "Back-projection — ") + detail.name;
+    const mb = _bpEl(v, "mode-badge");
+    mb.textContent = _modeLabel(mode); mb.className = "health-badge muted";
+    const sb = _bpEl(v, "source-badge");
+    sb.textContent = v.source === "remote" ? "Remote" : "Local";
+    sb.className = "health-badge " + (v.source === "remote" ? "warn" : "ok");
+
+    // Populate the captured-frame picker.
+    const fsel = _bpEl(v, "frame-select");
+    fsel.innerHTML = "";
+    if (v.frames.length === 0) {
+        const o = document.createElement("option");
+        o.value = ""; o.textContent = "No captured frames"; o.disabled = true; fsel.appendChild(o);
+    } else {
+        v.frames.forEach((name, i) => {
+            const o = document.createElement("option");
+            o.value = name; o.textContent = `#${i + 1} — ${name}`; fsel.appendChild(o);
+        });
+    }
+
+    // Detect the live source/agent up-front (remote pulls cameras).
+    await _bpRefreshAgent(v, false);
+
+    // Default frame source: the depth view opens on captured frames when
+    // available (instant heatmap, no camera needed); back-projection starts live.
+    const wantCaptured = v.mode === "depth" && v.frames.length > 0;
+    _bpSetFrameSource(v, wantCaptured ? "captured" : "live");
+    if (!wantCaptured) {
+        _bpSetOverlay(v, v.frameSource === "live"
+            ? "Press ▶ Start camera, or switch to a captured image."
+            : "Select a captured frame.");
+    }
+    _bpStartPolling(v);
+}
+
+function closeBpView(prefix) {
+    const v = _bpById(prefix);
+    _bpStop(v);
+    _bpStopPolling(v);
+    setMiddleView("detail");
+}
+
+// ----- frame source ---------------------------------------------------------
+
+function _bpSetFrameSource(v, src) {
+    v.frameSource = src;
+    if (src === "live") {
+        _bpStop(v);
+        v.frameName = null; v.frozen = false; v.lastImg = null;
+        v.bbox = null; v.drag = null;
+        _bpEl(v, "capture").disabled = true;
+        _bpEl(v, "clearbox").disabled = true;
+        _bpEl(v, "box-info").textContent = "";
+        if (v.mode === "ray") _bpEl(v, "result").hidden = true;
+        if (v.mode === "depth") { _bpEl(v, "depth-readout").textContent = ""; _bpClearDepthCanvas(v); }
+        _bpClearCanvas(v);
+        _bpSetOverlay(v, "Press ▶ Start camera, or switch to a captured image.");
+        _bpRefreshAgent(v, false);
+    } else {
+        _bpStop(v);
+        _bpRenderSource(v);
+        _bpLoadCapturedFrame(v);
+    }
+}
+
+function _bpLoadCapturedFrame(v) {
+    const name = _bpEl(v, "frame-select").value;
+    if (!name) { _bpSetOverlay(v, "No captured frames available."); return; }
+    v.frameName = name; v.frozen = true; v.lastFrameB64 = null;
+    v.bbox = null; v.drag = null;
+    _bpEl(v, "clearbox").disabled = true;
+    _bpEl(v, "box-info").textContent = "";
+    if (v.mode === "ray") { _bpEl(v, "result").hidden = true; _bpEl(v, "compute").disabled = true; }
+    _bpSetOverlay(v, "Loading frame…");
+    const img = new Image();
+    img.onload = () => {
+        v.lastImg = img;
+        _bpRedraw(v);
+        _bpSetOverlay(v, null);
+        _bpEl(v, "box-info").textContent = "Drag a box over the object" + (v.mode === "ray" ? ", then Compute." : " to measure depth.");
+        if (v.mode === "depth") _bpFetchDepth(v, null);
+    };
+    img.onerror = () => { _bpSetOverlay(v, "Failed to load the captured frame."); };
+    img.src = `/session-data/${v.sessionId}/frames/${encodeURIComponent(name)}`;
+}
+
+// ----- live streaming -------------------------------------------------------
+
+function _bpToggle(v) { if (v.streaming) { _bpStop(v); _bpRenderSource(v); } else { _bpStart(v); } }
+
+function _bpStop(v) {
+    if (v.es) { v.es.close(); v.es = null; }
+    v.streaming = false;
+    _bpEl(v, "start").textContent = "▶ Start camera";
+}
+
+function _bpStart(v) {
+    if (v.source === "remote") {
+        v.cameraId = _bpEl(v, "camera").value;
+        v.cameraId2 = v.stereoSeparate ? _bpEl(v, "camera-2").value : null;
+        if (v.stereoSeparate && v.cameraId === v.cameraId2) {
+            _bpSetStatus(v, "warn", "Left and right cameras must differ."); return;
+        }
+    } else {
+        v.cameraId = v.sessionCameraId;
+        v.cameraId2 = v.stereoSeparate ? v.sessionCameraId2 : null;
+    }
+    if (!v.cameraId) { _bpSetStatus(v, "bad", "No camera selected."); return; }
+    _bpStop(v);
+    v.frozen = false; v.bbox = null; v.drag = null;
+    _bpEl(v, "capture").disabled = false;
+    _bpEl(v, "clearbox").disabled = true;
+    _bpEl(v, "box-info").textContent = "";
+    if (v.mode === "ray") { _bpEl(v, "result").hidden = true; _bpEl(v, "compute").disabled = true; }
+    _bpSetOverlay(v, "Connecting to camera…");
+    let url = `/back-project/stream/${v.sessionId}?camera_id=${encodeURIComponent(v.cameraId)}`;
+    if (v.cameraId2) url += `&camera_id_2=${encodeURIComponent(v.cameraId2)}`;
+    if (v.source === "remote") url += `&agent_id=${encodeURIComponent(state.remoteAgentId)}`;
+    const es = new EventSource(url);
+    v.es = es; v.streaming = true;
+    _bpEl(v, "start").textContent = "⏹ Stop camera";
+    _bpRenderSource(v);
+    es.onmessage = (e) => {
+        let msg; try { msg = JSON.parse(e.data); } catch (_) { return; }
+        if (msg.type === "frame") {
+            _bpSetOverlay(v, null);
+            _bpDrawFrame(v, msg.data);
+        } else if (msg.type === "error") {
+            _bpSetStatus(v, "bad", "Stream error: " + msg.message);
+            _bpSetOverlay(v, "Stream error — " + msg.message);
+            _bpStop(v); _bpRenderSource(v);
+        }
+    };
+    es.onerror = () => {
+        if (v.streaming) { _bpSetOverlay(v, "Stream disconnected."); _bpStop(v); _bpRenderSource(v); }
+    };
+}
+
+function _bpCapture(v) {
+    if (!v.lastImg) { _bpSetStatus(v, "warn", "No frame yet — wait for video."); return; }
+    v.frozen = true;
+    _bpStop(v); _bpRenderSource(v);
+    v.bbox = null; v.drag = null;
+    _bpEl(v, "clearbox").disabled = true;
+    _bpRedraw(v);
+    _bpEl(v, "box-info").textContent = "Drag a box over the object" + (v.mode === "ray" ? ", then Compute." : " to measure depth.");
+    if (v.mode === "depth") _bpFetchDepth(v, null);
+}
+
+// ----- canvas + bbox --------------------------------------------------------
+
+function _bpClearCanvas(v) {
+    const cv = _bpEl(v, "canvas");
+    cv.getContext("2d").clearRect(0, 0, cv.width, cv.height);
+}
+
+function _bpDrawFrame(v, b64) {
+    v.lastFrameB64 = b64;
+    const buf = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)).buffer;
+    const url = URL.createObjectURL(new Blob([buf], { type: "image/jpeg" }));
+    const img = new Image();
+    img.onload = () => {
+        if (v.frozen) { URL.revokeObjectURL(url); return; }
+        v.lastImg = img; _bpRedraw(v); URL.revokeObjectURL(url);
+    };
+    img.src = url;
+}
+
+// Draw the current frame (left half only for stereo) + the bbox overlay.
+function _bpRedraw(v) {
+    if (!v.lastImg) return;
+    const img = v.lastImg;
+    const srcW = v.stereo ? Math.floor(img.naturalWidth / 2) : img.naturalWidth;
+    const srcH = img.naturalHeight;
+    const cv = _bpEl(v, "canvas");
+    cv.width = srcW; cv.height = srcH;
+    v.imgW = srcW; v.imgH = srcH;
+    const ctx = cv.getContext("2d");
+    ctx.drawImage(img, 0, 0, srcW, srcH, 0, 0, srcW, srcH);
+    const box = v.drag || v.bbox;
+    if (box) {
+        const lw = Math.max(2, srcW / 400);
+        ctx.lineWidth = lw; ctx.strokeStyle = "#4ea1ff";
+        ctx.strokeRect(box.x, box.y, box.w, box.h);
+        ctx.fillStyle = "rgba(78,161,255,0.12)";
+        ctx.fillRect(box.x, box.y, box.w, box.h);
+    }
+}
+
+function _bpCanvasPos(v, ev) {
+    const cv = _bpEl(v, "canvas");
+    const r = cv.getBoundingClientRect();
+    return {
+        x: (ev.clientX - r.left) * (cv.width / r.width),
+        y: (ev.clientY - r.top) * (cv.height / r.height),
+    };
+}
+
+function _bpUpdateBoxInfo(v) {
+    if (!v.bbox) { _bpEl(v, "box-info").textContent = ""; return; }
+    const b = v.bbox;
+    _bpEl(v, "box-info").textContent =
+        `box: x ${Math.round(b.x)}, y ${Math.round(b.y)}, w ${Math.round(b.w)}, h ${Math.round(b.h)} px` +
+        `  ·  center [${Math.round(b.x + b.w / 2)}, ${Math.round(b.y + b.h / 2)}]`;
+}
+
+function _bpWireCanvas(v) {
+    const cv = _bpEl(v, "canvas");
+    let start = null;
+    cv.addEventListener("mousedown", (ev) => {
+        if (!v.frozen) return;
+        start = _bpCanvasPos(v, ev); v.drag = { x: start.x, y: start.y, w: 0, h: 0 };
+    });
+    cv.addEventListener("mousemove", (ev) => {
+        if (!start) return;
+        const p = _bpCanvasPos(v, ev);
+        v.drag = {
+            x: Math.min(start.x, p.x), y: Math.min(start.y, p.y),
+            w: Math.abs(p.x - start.x), h: Math.abs(p.y - start.y),
+        };
+        _bpRedraw(v);
+    });
+    const finish = () => {
+        if (start && v.drag && v.drag.w > 3 && v.drag.h > 3) {
+            v.bbox = v.drag;
+            _bpEl(v, "clearbox").disabled = false;
+            _bpUpdateBoxInfo(v);
+            if (v.mode === "ray") _bpEl(v, "compute").disabled = false;
+            else _bpFetchDepth(v, v.bbox);
+        }
+        v.drag = null; start = null; _bpRedraw(v);
+    };
+    cv.addEventListener("mouseup", finish);
+    cv.addEventListener("mouseleave", finish);
+}
+
+function _bpClearBox(v) {
+    v.bbox = null; v.drag = null;
+    _bpEl(v, "clearbox").disabled = true;
+    _bpEl(v, "box-info").textContent = v.frozen ? "Drag a box over the object." : "";
+    if (v.mode === "ray") { _bpEl(v, "compute").disabled = true; _bpEl(v, "result").hidden = true; }
+    _bpRedraw(v);
+    if (v.mode === "depth" && v.frozen) _bpFetchDepth(v, null);
+}
+
+// ----- depth ----------------------------------------------------------------
+
+function _bpClearDepthCanvas(v) {
+    const cv = _bpEl(v, "depth-canvas");
+    if (cv) cv.getContext("2d").clearRect(0, 0, cv.width, cv.height);
+    const near = _bpEl(v, "cb-near"), far = _bpEl(v, "cb-far");
+    if (near) near.textContent = "near";
+    if (far) far.textContent = "far";
+}
+
+async function _bpFetchDepth(v, bbox) {
+    if (v.mode !== "depth") return;
+    const body = {};
+    if (v.frameSource === "captured" && v.frameName) body.frame = v.frameName;
+    else if (v.lastFrameB64) body.image = v.lastFrameB64;
+    else return;
+    if (bbox) body.bbox = { x: bbox.x, y: bbox.y, w: bbox.w, h: bbox.h };
+    _bpEl(v, "depth-spinner").hidden = false;
+    _bpEl(v, "depth-readout").textContent = "computing…";
+    try {
+        const r = await api(`/back-project/${v.sessionId}/depth`, {
+            method: "POST", body: JSON.stringify(body),
+        });
+        if (r.heatmap) {
+            const img = new Image();
+            img.onload = () => {
+                const cv = _bpEl(v, "depth-canvas");
+                cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+                cv.getContext("2d").drawImage(img, 0, 0);
+            };
+            img.src = "data:image/jpeg;base64," + r.heatmap;
+        }
+        if (r.lo_mm != null && r.hi_mm != null) {
+            _bpEl(v, "cb-near").textContent = `${r.lo_mm.toFixed(0)} mm`;
+            _bpEl(v, "cb-far").textContent = `${r.hi_mm.toFixed(0)} mm`;
+        }
+        _bpEl(v, "depth-readout").textContent = (r.depth_mm != null)
+            ? `box depth ≈ ${r.depth_mm.toFixed(0)} mm`
+            : (r.lo_mm != null ? "draw a box to measure depth" : "no valid disparity");
+    } catch (err) {
+        _bpEl(v, "depth-readout").textContent = "failed: " + err.message;
+    } finally {
+        _bpEl(v, "depth-spinner").hidden = true;
+    }
+}
+
+// ----- ray compute (back-projection only) -----------------------------------
+
+async function _bpCompute(v) {
+    if (!v.bbox) { _bpSetStatus(v, "warn", "Draw a bounding box first."); return; }
+    const num = (s) => parseFloat(_bpEl(v, s).value) || 0;
+    const body = {
+        rvec: [num("rx"), num("ry"), num("rz")],
+        tvec: [num("tx"), num("ty"), num("tz")],
+        bbox: { x: v.bbox.x, y: v.bbox.y, w: v.bbox.w, h: v.bbox.h },
+    };
+    _bpEl(v, "compute").disabled = true;
+    try {
+        const r = await api(`/back-project/${v.sessionId}/compute`, {
+            method: "POST", body: JSON.stringify(body),
+        });
+        const f = (a) => "[" + a.map((x) => x.toFixed(4)).join(", ") + "]";
+        _bpEl(v, "result").innerHTML =
+            `<div class="bp-result-row"><span class="k">bbox center (px)</span><span class="v">${f(r.bbox_center)}</span></div>` +
+            `<div class="bp-result-row"><span class="k">ray origin (world)</span><span class="v">${f(r.origin)}</span></div>` +
+            `<div class="bp-result-row"><span class="k">ray direction (unit)</span><span class="v">${f(r.direction)}</span></div>`;
+        _bpEl(v, "result").hidden = false;
+    } catch (err) {
+        _bpSetStatus(v, "bad", "Compute failed: " + err.message);
+    } finally {
+        _bpEl(v, "compute").disabled = false;
+    }
+}
+
+function _bpResetExt(v) {
+    ["rx", "ry", "rz", "tx", "ty", "tz"].forEach((s) => { _bpEl(v, s).value = "0"; });
+}
+
+// ----- public entry points + wiring ----------------------------------------
+
+function openBackprojectView(sessionId) { return _bpOpen(_rayView, sessionId); }
+function openDepthView(sessionId) { return _bpOpen(_depthView, sessionId); }
+
+[_rayView, _depthView].forEach((v) => {
+    _bpWireCanvas(v);
+    _bpEl(v, "start").addEventListener("click", () => _bpToggle(v));
+    _bpEl(v, "capture").addEventListener("click", () => _bpCapture(v));
+    _bpEl(v, "clearbox").addEventListener("click", () => _bpClearBox(v));
+    _bpEl(v, "refresh-cams").addEventListener("click", () => _bpRefreshAgent(v, true));
+    _bpEl(v, "src-live").addEventListener("click", () => { if (v.frameSource !== "live") _bpSetFrameSource(v, "live"); });
+    _bpEl(v, "src-captured").addEventListener("click", () => {
+        if (_bpEl(v, "src-captured").disabled) return;
+        if (v.frameSource !== "captured") _bpSetFrameSource(v, "captured");
+    });
+    _bpEl(v, "frame-select").addEventListener("change", () => {
+        if (v.frameSource === "captured") _bpLoadCapturedFrame(v);
+    });
+});
+_rayView && _bpEl(_rayView, "compute").addEventListener("click", () => _bpCompute(_rayView));
+_rayView && _bpEl(_rayView, "reset-ext").addEventListener("click", () => _bpResetExt(_rayView));
+
+$("test-backproject").addEventListener("click", () => {
+    if (_activeIntrinsicsId) openBackprojectView(_activeIntrinsicsId);
+});
+$("test-depth").addEventListener("click", () => {
+    if (_activeIntrinsicsId) openDepthView(_activeIntrinsicsId);
+});
 
 async function openSessionDir(id) {
     try {
@@ -1929,6 +2460,20 @@ async function _doDisableAgent() {
 }
 
 ui.disableAgentBtn.addEventListener("click", _doDisableAgent);
+
+// When the page is closed / reloaded / refreshed, tell the server to stop the
+// remote agent so it releases the engaged camera instead of lingering on the
+// remote box.  `pagehide` is more reliable than `beforeunload` (fires on
+// bfcache / mobile too), and sendBeacon survives unload as fire-and-forget.
+window.addEventListener("pagehide", () => {
+    if (state.remoteAgentId) {
+        navigator.sendBeacon(
+            "/remote/ssh-disable",
+            new Blob([JSON.stringify({ agent_id: state.remoteAgentId })],
+                     { type: "application/json" }),
+        );
+    }
+});
 
 // ---------- Remote camera list ----------
 

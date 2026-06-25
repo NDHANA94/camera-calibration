@@ -234,10 +234,168 @@
                     <span id="detail-title">Session Detail</span>
                     <div style="display:flex;gap:5px;align-items:center">
                         <button id="copy-intrinsics" class="secondary small" hidden>Copy YAML</button>
+                        <button id="test-backproject" class="secondary small" hidden>Test Back-project</button>
+                        <button id="test-depth" class="secondary small" hidden>Depth prediction</button>
                         <button class="secondary small" onclick="closeDetail()">✕ Close</button>
                     </div>
                 </div>
                 <div id="detail-body"></div>
+            </div>
+
+            <!-- BACK-PROJECTION view: pick a frame, draw a bbox, compute a world ray -->
+            <div class="detail-panel bp-panel" id="backproject-panel" hidden>
+                <div class="detail-header">
+                    <span class="bp-head-title">
+                        <span id="bp-title">Back-projection</span>
+                        <span id="bp-mode-badge" class="health-badge muted">ray</span>
+                        <span id="bp-source-badge" class="health-badge muted"></span>
+                    </span>
+                    <div class="bp-head-actions">
+                        <button class="secondary small" onclick="closeBpView('bp')">✕ Close</button>
+                    </div>
+                </div>
+                <div class="bp-body">
+                    <!-- Source & camera -->
+                    <div class="bp-card">
+                        <div class="bp-card-head">
+                            <span class="bp-card-title">Source &amp; camera</span>
+                            <div class="bp-card-tools">
+                                <button id="bp-refresh-cams" class="secondary small" hidden>↻ Cameras</button>
+                            </div>
+                        </div>
+                        <div class="bp-status-row">
+                            <span id="bp-status-dot" class="bp-dot"></span>
+                            <span id="bp-status" class="bp-status-text">Loading…</span>
+                        </div>
+                        <div class="bp-seg" role="tablist">
+                            <button id="bp-src-live" class="bp-seg-btn active">📹 Live camera</button>
+                            <button id="bp-src-captured" class="bp-seg-btn">🖼 Captured image</button>
+                        </div>
+                        <div class="bp-fields">
+                            <label class="bp-field" id="bp-camera-field" hidden><span>Camera</span><select id="bp-camera"></select></label>
+                            <label class="bp-field" id="bp-camera-2-field" hidden><span>Right camera</span><select id="bp-camera-2"></select></label>
+                            <label class="bp-field" id="bp-frame-field" hidden><span>Captured frame</span><select id="bp-frame-select"></select></label>
+                        </div>
+                    </div>
+                    <!-- Frame stage -->
+                    <div class="bp-card">
+                        <div class="bp-card-head">
+                            <span class="bp-card-title">Frame</span>
+                            <div class="bp-card-tools">
+                                <button id="bp-start" class="primary small">▶ Start camera</button>
+                                <button id="bp-capture" class="secondary small" disabled>📷 Capture</button>
+                                <button id="bp-clearbox" class="secondary small" disabled>⨯ Clear box</button>
+                            </div>
+                        </div>
+                        <div class="bp-stage">
+                            <canvas id="bp-canvas" width="640" height="360"></canvas>
+                            <div id="bp-stage-overlay" class="bp-stage-overlay"></div>
+                            <div id="bp-spinner" class="bp-spinner" hidden></div>
+                        </div>
+                        <div id="bp-box-info" class="bp-box-info"></div>
+                    </div>
+                    <!-- Extrinsics + ray result -->
+                    <div class="bp-card" id="bp-extrinsics-card">
+                        <div class="bp-card-head">
+                            <span class="bp-card-title">Extrinsics (world → camera)</span>
+                            <div class="bp-card-tools">
+                                <button id="bp-reset-ext" class="secondary small">Reset</button>
+                            </div>
+                        </div>
+                        <div class="bp-ext-grid">
+                            <div class="bp-ext-group">
+                                <div class="bp-ext-label">Rotation vector — Rodrigues (rad)</div>
+                                <div class="bp-ext-inputs">
+                                    <label>rx<input id="bp-rx" type="number" step="any" value="0"></label>
+                                    <label>ry<input id="bp-ry" type="number" step="any" value="0"></label>
+                                    <label>rz<input id="bp-rz" type="number" step="any" value="0"></label>
+                                </div>
+                            </div>
+                            <div class="bp-ext-group">
+                                <div class="bp-ext-label">Translation (mm)</div>
+                                <div class="bp-ext-inputs">
+                                    <label>tx<input id="bp-tx" type="number" step="any" value="0"></label>
+                                    <label>ty<input id="bp-ty" type="number" step="any" value="0"></label>
+                                    <label>tz<input id="bp-tz" type="number" step="any" value="0"></label>
+                                </div>
+                            </div>
+                        </div>
+                        <button id="bp-compute" class="primary small full bp-compute-btn" disabled>Compute back-projection ray</button>
+                        <div id="bp-result" class="bp-result" hidden></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- DEPTH PREDICTION view (stereo only): pick a frame, view a depth heatmap -->
+            <div class="detail-panel bp-panel" id="depth-panel" hidden>
+                <div class="detail-header">
+                    <span class="bp-head-title">
+                        <span id="dp-title">Depth prediction</span>
+                        <span id="dp-mode-badge" class="health-badge muted">stereo</span>
+                        <span id="dp-source-badge" class="health-badge muted"></span>
+                    </span>
+                    <div class="bp-head-actions">
+                        <button class="secondary small" onclick="closeBpView('dp')">✕ Close</button>
+                    </div>
+                </div>
+                <div class="bp-body">
+                    <!-- Source & camera -->
+                    <div class="bp-card">
+                        <div class="bp-card-head">
+                            <span class="bp-card-title">Source &amp; camera</span>
+                            <div class="bp-card-tools">
+                                <button id="dp-refresh-cams" class="secondary small" hidden>↻ Cameras</button>
+                            </div>
+                        </div>
+                        <div class="bp-status-row">
+                            <span id="dp-status-dot" class="bp-dot"></span>
+                            <span id="dp-status" class="bp-status-text">Loading…</span>
+                        </div>
+                        <div class="bp-seg" role="tablist">
+                            <button id="dp-src-live" class="bp-seg-btn active">📹 Live camera</button>
+                            <button id="dp-src-captured" class="bp-seg-btn">🖼 Captured image</button>
+                        </div>
+                        <div class="bp-fields">
+                            <label class="bp-field" id="dp-camera-field" hidden><span>Camera</span><select id="dp-camera"></select></label>
+                            <label class="bp-field" id="dp-camera-2-field" hidden><span>Right camera</span><select id="dp-camera-2"></select></label>
+                            <label class="bp-field" id="dp-frame-field" hidden><span>Captured frame</span><select id="dp-frame-select"></select></label>
+                        </div>
+                    </div>
+                    <!-- Frame stage -->
+                    <div class="bp-card">
+                        <div class="bp-card-head">
+                            <span class="bp-card-title">Frame (left eye)</span>
+                            <div class="bp-card-tools">
+                                <button id="dp-start" class="primary small">▶ Start camera</button>
+                                <button id="dp-capture" class="secondary small" disabled>📷 Capture</button>
+                                <button id="dp-clearbox" class="secondary small" disabled>⨯ Clear box</button>
+                            </div>
+                        </div>
+                        <div class="bp-stage">
+                            <canvas id="dp-canvas" width="640" height="360"></canvas>
+                            <div id="dp-stage-overlay" class="bp-stage-overlay"></div>
+                            <div id="dp-spinner" class="bp-spinner" hidden></div>
+                        </div>
+                        <div id="dp-box-info" class="bp-box-info"></div>
+                    </div>
+                    <!-- Depth heatmap -->
+                    <div class="bp-card" id="dp-depth-card">
+                        <div class="bp-card-head">
+                            <span class="bp-card-title">Depth map</span>
+                            <span id="dp-depth-readout" class="bp-depth-readout"></span>
+                        </div>
+                        <div class="bp-stage">
+                            <canvas id="dp-depth-canvas" width="640" height="360"></canvas>
+                            <div id="dp-depth-spinner" class="bp-spinner" hidden></div>
+                        </div>
+                        <div class="bp-colorbar-wrap">
+                            <span id="dp-cb-near" class="bp-cb-label">near</span>
+                            <div class="bp-colorbar"></div>
+                            <span id="dp-cb-far" class="bp-cb-label far">far</span>
+                        </div>
+                        <div class="bp-hint-line">Heatmap: red = near, blue = far, black = no disparity. Draw a box on the frame to measure its depth.</div>
+                    </div>
+                </div>
             </div>
 
             <!-- PLACEHOLDER: idle, nothing selected -->

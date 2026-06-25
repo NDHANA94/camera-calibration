@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .core.storage import SESSIONS_DIR, STATIC_DIR, ensure_dirs
+from .routes.backproject import router as backproject_router
 from .routes.calibration import router as calibration_router
 from .routes.cameras import router as cameras_router
 from .routes.profiles import router_chessboards, router_profiles
@@ -34,6 +35,7 @@ app.include_router(sessions_router)
 app.include_router(calibration_router)
 app.include_router(stream_router)
 app.include_router(remote_ssh_router)
+app.include_router(backproject_router)
 
 
 @app.on_event("shutdown")
