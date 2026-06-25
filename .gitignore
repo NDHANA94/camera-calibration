@@ -12,3 +12,5 @@ server/data/sessions/*
 *.yaml
 *.png
 .DS_Store
+.claude/
+.pytest_cache/
